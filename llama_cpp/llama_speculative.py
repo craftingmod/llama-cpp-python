@@ -1,7 +1,9 @@
 import abc
 import collections
+import ctypes
+import os
 
-from typing import Any, DefaultDict, Dict, List, Literal, Optional, Tuple
+from typing import Any, DefaultDict, Dict, List, Literal, Optional, Tuple, Union
 
 import numpy as np
 import numpy.typing as npt
@@ -13,6 +15,335 @@ class LlamaDraftModel(abc.ABC):
         self, input_ids: npt.NDArray[np.intc], /, **kwargs: Any
     ) -> npt.NDArray[np.intc]:
         raise NotImplementedError()
+
+
+class LlamaNativeSpeculativeDecoding(LlamaDraftModel):
+    """Experimental llama.cpp/common GGUF draft-model integration.
+
+    The draft model is loaded lazily when this object is attached to ``Llama``.
+    This first implementation intentionally supports one text sequence and the
+    DFlash/DSpark block-diffusion implementations only.
+    """
+
+    is_native = True
+    _SUPPORTED_TYPES = {"draft-dflash", "draft-dspark"}
+
+    def __init__(
+        self,
+        model_path: str,
+        *,
+        spec_type: Literal["draft-dflash", "draft-dspark"] = "draft-dflash",
+        n_max: int = 15,
+        n_min: int = 0,
+        p_min: float = 0.0,
+        n_gpu_layers: Union[int, Literal["auto", "all"]] = "auto",
+        n_threads: Optional[int] = None,
+        n_threads_batch: Optional[int] = None,
+        type_k: Optional[int] = None,
+        type_v: Optional[int] = None,
+        flash_attn_type: int = -1,
+        offload_kqv: bool = True,
+        op_offload: bool = True,
+        kv_unified: bool = False,
+        no_perf: bool = False,
+        verbose: bool = True,
+    ) -> None:
+        if not os.path.isfile(model_path):
+            raise ValueError(f"Draft model path does not exist: {model_path}")
+
+        normalized_type = spec_type.strip().lower()
+        if normalized_type not in self._SUPPORTED_TYPES:
+            raise ValueError(
+                "spec_type must be 'draft-dflash' or 'draft-dspark' in this "
+                "experimental implementation"
+            )
+        if n_max <= 0:
+            raise ValueError("n_max must be greater than zero")
+        if n_min < 0 or n_min > n_max:
+            raise ValueError("n_min must be between zero and n_max")
+        if not 0.0 <= p_min <= 1.0:
+            raise ValueError("p_min must be between zero and one")
+        if n_threads is not None and n_threads <= 0:
+            raise ValueError("n_threads must be greater than zero")
+        if n_threads_batch is not None and n_threads_batch <= 0:
+            raise ValueError("n_threads_batch must be greater than zero")
+
+        self.model_path = os.fspath(model_path)
+        self.spec_type = normalized_type
+        self.n_max = int(n_max)
+        self.n_min = int(n_min)
+        self.p_min = float(p_min)
+        self.n_gpu_layers = self._parse_n_gpu_layers(n_gpu_layers)
+        self.n_threads = n_threads
+        self.n_threads_batch = n_threads_batch
+        # GGML_TYPE_F16. Keeping the numeric default here avoids importing the
+        # heavyweight ctypes backend before Llama attaches this object.
+        self.type_k = 1 if type_k is None else int(type_k)
+        self.type_v = 1 if type_v is None else int(type_v)
+        self.flash_attn_type = int(flash_attn_type)
+        self.offload_kqv = bool(offload_kqv)
+        self.op_offload = bool(op_offload)
+        self.kv_unified = bool(kv_unified)
+        self.no_perf = bool(no_perf)
+        self.verbose = bool(verbose)
+
+        self._native: Any = None
+        self._handle: Any = None
+        self._bound_model: Any = None
+        self._bound_context: Any = None
+        self._closed = False
+        self._last_draft_len = 0
+        self._draft_calls = 0
+        self._accept_calls = 0
+        self._drafted_tokens = 0
+        self._accepted_tokens = 0
+
+    @property
+    def max_draft_tokens(self) -> int:
+        return self.n_max
+
+    @property
+    def stats(self) -> Dict[str, Union[int, float]]:
+        """Return lifetime draft and acceptance counters for this instance."""
+        acceptance_rate = (
+            self._accepted_tokens / self._drafted_tokens
+            if self._drafted_tokens > 0
+            else 0.0
+        )
+        mean_accepted = (
+            self._accepted_tokens / self._accept_calls
+            if self._accept_calls > 0
+            else 0.0
+        )
+        return {
+            "draft_calls": self._draft_calls,
+            "accept_calls": self._accept_calls,
+            "drafted_tokens": self._drafted_tokens,
+            "accepted_tokens": self._accepted_tokens,
+            "acceptance_rate": acceptance_rate,
+            "mean_accepted_tokens": mean_accepted,
+        }
+
+    @staticmethod
+    def _parse_n_gpu_layers(value: Union[int, str]) -> int:
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized == "auto":
+                return -1
+            if normalized == "all":
+                return -2
+            try:
+                return int(normalized)
+            except ValueError as exc:
+                raise ValueError(
+                    "n_gpu_layers must be an int, 'auto', or 'all'"
+                ) from exc
+        if isinstance(value, int):
+            return value
+        raise TypeError("n_gpu_layers must be an int, 'auto', or 'all'")
+
+    @staticmethod
+    def _load_native_module() -> Any:
+        try:
+            from . import llama_speculative_cpp
+        except (AttributeError, ImportError, OSError, RuntimeError) as exc:
+            raise RuntimeError(
+                "Native speculative decoding is unavailable. Rebuild/reinstall "
+                "llama-cpp-python from this experimental branch so llama-common "
+                "contains the native speculative bridge."
+            ) from exc
+        return llama_speculative_cpp
+
+    def _require_handle(self) -> Tuple[Any, Any]:
+        if self._closed:
+            raise RuntimeError("Native speculative decoder has been closed")
+        if self._native is None or self._handle is None:
+            raise RuntimeError(
+                "Native speculative decoder is not attached to a Llama instance"
+            )
+        return self._native, self._handle
+
+    def _last_error(self) -> str:
+        if self._native is None or self._handle is None:
+            return "native speculative decoder is not initialized"
+        message = self._native.llama_cpp_native_speculative_last_error(self._handle)
+        return message.decode("utf-8", errors="replace") if message else "unknown error"
+
+    def _bind(self, model: Any, context: Any) -> None:
+        if self._closed:
+            raise RuntimeError("Cannot attach a closed native speculative decoder")
+        if self._handle is not None:
+            if model is self._bound_model and context is self._bound_context:
+                return
+            raise RuntimeError(
+                "A native speculative decoder instance cannot be shared by multiple Llama instances"
+            )
+
+        native = self._load_native_module()
+        params = native.llama_cpp_native_speculative_params()
+        params.struct_size = ctypes.sizeof(native.llama_cpp_native_speculative_params)
+        params.model_path = os.fsencode(self.model_path)
+        params.spec_type = self.spec_type.encode("ascii")
+        params.n_gpu_layers = self.n_gpu_layers
+        params.n_ctx = int(context.n_ctx())
+        params.n_batch = int(context.n_batch())
+        params.n_ubatch = int(context.n_ubatch())
+        params.n_threads = int(self.n_threads or context.params.n_threads)
+        params.n_threads_batch = int(
+            self.n_threads_batch or context.params.n_threads_batch
+        )
+        params.n_max = self.n_max
+        params.n_min = self.n_min
+        params.p_min = self.p_min
+        params.cache_type_k = self.type_k
+        params.cache_type_v = self.type_v
+        params.flash_attn_type = self.flash_attn_type
+        params.offload_kqv = self.offload_kqv
+        params.op_offload = self.op_offload
+        params.kv_unified = self.kv_unified
+        params.no_perf = self.no_perf
+
+        error = ctypes.create_string_buffer(1024)
+        handle = native.llama_cpp_native_speculative_init(
+            model.model,
+            context.ctx,
+            ctypes.byref(params),
+            error,
+            len(error),
+        )
+        if not handle:
+            message = error.value.decode("utf-8", errors="replace")
+            raise RuntimeError(
+                "Failed to initialize native speculative decoder: "
+                + (message or "unknown error")
+            )
+
+        self._native = native
+        self._handle = handle
+        self._bound_model = model
+        self._bound_context = context
+
+    @staticmethod
+    def _token_buffer(tokens: npt.ArrayLike) -> Tuple[npt.NDArray[np.int32], Any]:
+        array = np.ascontiguousarray(tokens, dtype=np.int32)
+        pointer = array.ctypes.data_as(ctypes.POINTER(ctypes.c_int32))
+        return array, pointer
+
+    def _begin(self, prompt_tokens: npt.ArrayLike) -> None:
+        native, handle = self._require_handle()
+        prompt, pointer = self._token_buffer(prompt_tokens)
+        if not native.llama_cpp_native_speculative_begin(
+            handle, pointer, prompt.size
+        ):
+            raise RuntimeError(
+                f"Native speculative begin failed: {self._last_error()}"
+            )
+
+    def _process_batch(self, batch: Any) -> None:
+        native, handle = self._require_handle()
+        if not native.llama_cpp_native_speculative_process(
+            handle, ctypes.byref(batch)
+        ):
+            raise RuntimeError(
+                f"Native speculative batch processing failed: {self._last_error()}"
+            )
+
+    def __call__(
+        self, input_ids: npt.NDArray[np.intc], /, **kwargs: Any
+    ) -> npt.NDArray[np.intc]:
+        native, handle = self._require_handle()
+        prompt, pointer = self._token_buffer(input_ids)
+        if prompt.size == 0:
+            raise ValueError("Native speculative decoding requires at least one input token")
+
+        capacity = min(
+            self.n_max,
+            int(kwargs.get("max_tokens", self.n_max)),
+        )
+        if capacity <= 0:
+            return np.empty(0, dtype=np.intc)
+
+        output = np.empty(capacity, dtype=np.int32)
+        count = native.llama_cpp_native_speculative_draft(
+            handle,
+            prompt.size - 1,
+            int(prompt[-1]),
+            pointer,
+            prompt.size,
+            output.ctypes.data_as(ctypes.POINTER(ctypes.c_int32)),
+            capacity,
+        )
+        if count < 0:
+            raise RuntimeError(f"Native speculative draft failed: {self._last_error()}")
+        self._last_draft_len = int(count)
+        self._draft_calls += 1
+        self._drafted_tokens += self._last_draft_len
+        return output[:count].astype(np.intc, copy=False)
+
+    def accept(self, n_accepted: int) -> None:
+        native, handle = self._require_handle()
+        if n_accepted < 0 or n_accepted > self._last_draft_len:
+            raise ValueError("n_accepted must be within the last native draft")
+        if not native.llama_cpp_native_speculative_accept(handle, n_accepted):
+            raise RuntimeError(f"Native speculative accept failed: {self._last_error()}")
+        self._accept_calls += 1
+        self._accepted_tokens += n_accepted
+        self._last_draft_len = 0
+
+    def memory_seq_rm(self, p0: int, p1: int) -> None:
+        native, handle = self._require_handle()
+        if not native.llama_cpp_native_speculative_memory_seq_rm(handle, p0, p1):
+            raise RuntimeError(
+                f"Native draft-context rollback failed: {self._last_error()}"
+            )
+
+    def memory_seq_add(self, p0: int, p1: int, delta: int) -> None:
+        native, handle = self._require_handle()
+        if not native.llama_cpp_native_speculative_memory_seq_add(
+            handle, p0, p1, delta
+        ):
+            raise RuntimeError(
+                f"Native draft-context shift failed: {self._last_error()}"
+            )
+
+    def clear(self) -> None:
+        native, handle = self._require_handle()
+        if not native.llama_cpp_native_speculative_memory_clear(handle, True):
+            raise RuntimeError(
+                f"Native draft-context clear failed: {self._last_error()}"
+            )
+        self._last_draft_len = 0
+
+    def print_stats(self) -> None:
+        native, handle = self._require_handle()
+        stats = self.stats
+        print(
+            "native speculative stats: "
+            f"draft calls={stats['draft_calls']}, "
+            f"accept calls={stats['accept_calls']}, "
+            f"drafted tokens={stats['drafted_tokens']}, "
+            f"accepted tokens={stats['accepted_tokens']}, "
+            f"token acceptance={stats['acceptance_rate']:.1%}, "
+            f"mean accepted/call={stats['mean_accepted_tokens']:.2f}",
+            flush=True,
+        )
+        native.llama_cpp_native_speculative_print_stats(handle)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        if self._native is not None and self._handle is not None:
+            self._native.llama_cpp_native_speculative_free(self._handle)
+        self._handle = None
+        self._bound_context = None
+        self._bound_model = None
+        self._closed = True
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
 class LlamaNGramMapDecoding(LlamaDraftModel):

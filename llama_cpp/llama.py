@@ -302,6 +302,20 @@ class Llama:
         self.verbose = verbose
         self.verbosity = verbosity
         self._stack = contextlib.ExitStack()
+        self._native_speculative = (
+            draft_model if getattr(draft_model, "is_native", False) else None
+        )
+
+        if self._native_speculative is not None:
+            if n_seq_max != 1:
+                raise ValueError(
+                    "Experimental native speculative decoding only supports n_seq_max=1"
+                )
+            if mmproj_path is not None:
+                raise ValueError(
+                    "Experimental native speculative decoding is text-only; "
+                    "mmproj_path is not supported"
+                )
 
         configure_logging(
             verbose=verbose,
@@ -567,7 +581,15 @@ class Llama:
         )
         self.context_params.yarn_orig_ctx = yarn_orig_ctx if yarn_orig_ctx != 0 else 0
 
-        self._logits_all = logits_all if draft_model is None else True
+        # Callable Python draft models need historical logits copied into the
+        # Python score matrix. Native llama.cpp speculation samples the small
+        # verification block directly from the context and must not allocate an
+        # n_ctx x n_vocab score matrix merely because a draft GGUF is attached.
+        self._logits_all = (
+            logits_all
+            if draft_model is None or self._native_speculative is not None
+            else True
+        )
 
         self.context_params.embeddings = embeddings
         self.context_params.offload_kqv = offload_kqv
@@ -640,6 +662,33 @@ class Llama:
             self.context_params.n_batch = self.n_batch
             self.context_params.n_ubatch = min(self.n_batch, n_ubatch)
 
+        if self._native_speculative is not None:
+            native_n_max = int(self._native_speculative.max_draft_tokens)
+            required_outputs = native_n_max + 1
+            if required_outputs > self.n_batch:
+                raise ValueError(
+                    "Native speculative verification requires n_batch >= "
+                    f"n_max + 1 ({required_outputs}), got {self.n_batch}"
+                )
+            if required_outputs > n_ctx:
+                raise ValueError(
+                    "Native speculative decoding requires n_ctx >= n_max + 1 "
+                    f"({required_outputs}), got {n_ctx}"
+                )
+
+            self.n_rs_seq = max(self.n_rs_seq, native_n_max)
+            self.context_params.n_rs_seq = self.n_rs_seq
+            self.context_params.n_ubatch = max(
+                int(self.context_params.n_ubatch), required_outputs
+            )
+            output_capacity = self.n_batch if self._logits_all else required_outputs
+            self.context_params.n_outputs_max = max(
+                int(self.context_params.n_outputs_max), output_capacity
+            )
+            self.context_params.n_outputs_max_per_seq = max(
+                int(self.context_params.n_outputs_max_per_seq), output_capacity
+            )
+
         self._ctx = self._stack.enter_context(
             contextlib.closing(
                 internals.LlamaContext(
@@ -667,7 +716,7 @@ class Llama:
         # - the model architecture is marked as recurrent or hybrid
         self.is_hybrid = _is_recurrent or _is_hybrid or (_n_swa > 0 and not self.context_params.swa_full)
 
-        if self.is_hybrid:
+        if self.is_hybrid and self._native_speculative is None:
             if self.verbose:
                 print(
                     f"Llama.__init__: Hybrid/Recurrent model detected. "
@@ -712,6 +761,12 @@ class Llama:
         ] = {}
 
         self.draft_model = draft_model
+
+        if self._native_speculative is not None:
+            self._native_speculative._bind(self._model, self._ctx)
+            # Entered after model/context/batch, so ExitStack closes the native
+            # drafter first while its borrowed target pointers are still alive.
+            self._stack.enter_context(contextlib.closing(self._native_speculative))
 
         self._n_vocab = self.n_vocab()
         self._n_ctx = self.n_ctx()
@@ -1078,6 +1133,11 @@ class Llama:
         Args:
             cache: The cache to set.
         """
+        if self._native_speculative is not None and cache is not None:
+            raise RuntimeError(
+                "Python state caches are not supported with experimental native "
+                "speculative decoding because they do not include the draft context"
+            )
         self.cache = cache
 
     def set_seed(self, seed: int):
@@ -1090,7 +1150,21 @@ class Llama:
 
     def reset(self):
         """Reset the model state."""
+        if self._native_speculative is not None:
+            self._ctx.memory_clear(True)
+            self._native_speculative.clear()
         self.n_tokens = 0
+
+    def _native_speculative_truncate(self, position: int) -> None:
+        """Truncate target and native draft state at the same token position."""
+        if self._native_speculative is None:
+            raise RuntimeError("Native speculative decoder is not configured")
+        if not self._ctx.memory_seq_rm(0, position, -1):
+            raise RuntimeError(
+                "Target context could not roll back the native speculative block. "
+                "Increase n_rs_seq/n_max or start a fresh generation."
+            )
+        self._native_speculative.memory_seq_rm(position, -1)
 
     def abort(self) -> None:
         """
@@ -1138,6 +1212,8 @@ class Llama:
             active_loras: Optional[List[Dict[str, Union[str, float]]]] = None,
             control_vector: Optional[Dict[str, Any]] = None,
             copy_logits: bool = True,
+            output_all: bool = False,
+            require_atomic: bool = False,
     ):
         """Evaluate a list of tokens.
 
@@ -1151,6 +1227,11 @@ class Llama:
                 ``logits_all`` is disabled. Set to ``False`` for native sampler paths
                 that sample directly from the llama context and do not need
                 Python-side logits.
+            output_all: Request a target output row for every input token without
+                copying an ``n_ctx x n_vocab`` Python score history.
+            require_atomic: Require all tokens to be processed by one ``llama_decode``
+                call. Native draft verification uses this because earlier output rows
+                do not survive adaptive sub-batch retries.
         """
         n_eval = len(tokens)
         if n_eval == 0:
@@ -1161,8 +1242,18 @@ class Llama:
         # and cause hard crashes instead of Python exceptions.
         self._validate_eval_tokens(tokens)
 
+        if require_atomic and n_eval > self.n_batch:
+            raise RuntimeError(
+                f"Llama.eval: atomic batch has {n_eval} tokens but n_batch={self.n_batch}"
+            )
+
         # Context Shift: Prevent OOM by discarding older tokens when context limit is reached.
         if self.n_tokens + n_eval > self._n_ctx:
+            if self._native_speculative is not None:
+                raise RuntimeError(
+                    "Context shifting is not supported by experimental native "
+                    "speculative decoding; increase n_ctx or start a fresh generation"
+                )
             # 0. Check if the memory supports shifting
             if not self._ctx.memory_can_shift():
                 raise RuntimeError(
@@ -1216,7 +1307,7 @@ class Llama:
                 self.n_tokens -= _n_discard
 
         # Adaptive batch downgrade limit initialization
-        current_max_batch = self.n_batch
+        current_max_batch = n_eval if require_atomic else self.n_batch
         last_ckpt_pos = self.n_tokens
 
         # Adaptive Periodic Checkpointing for Hybrid Models
@@ -1241,7 +1332,7 @@ class Llama:
             # Configure logits extraction:
             # If _logits_all is True, calculate for every token.
             # Otherwise, only calculate for the very last token in the entire evaluation sequence.
-            if self._logits_all:
+            if self._logits_all or output_all:
                 logits_array = [True] * n_chunk
             else:
                 logits_array = [False] * n_chunk
@@ -1300,6 +1391,11 @@ class Llama:
 
                     # 0: Success
                     if status == 0:
+                        if self._native_speculative is not None:
+                            # DFlash/DSpark target-layer extraction buffers are
+                            # overwritten by the next decode. Process this exact
+                            # successful batch while those rows are still live.
+                            self._native_speculative._process_batch(self._batch.batch)
                         success = True
                         # If we successfully decoded after a downgrade,
                         # update current_max_batch to prevent repeated failures in next iterations.
@@ -1309,6 +1405,14 @@ class Llama:
 
                     # 1: No KV slot available (Recoverable)
                     elif status == 1:
+                        if require_atomic:
+                            if self.verbose:
+                                print(
+                                    "Llama.eval: atomic speculative verification batch "
+                                    "could not acquire a KV slot.",
+                                    file=sys.stderr,
+                                )
+                            break
                         if current_batch_size == 1:
                             if self.verbose:
                                 print("Llama.eval: KV slots completely full. "
@@ -1327,6 +1431,11 @@ class Llama:
                                        f"Batch size {current_batch_size}, chunk[:{min_pos}]={preview}: {str(e)}") from e
 
             if not success:
+                if require_atomic:
+                    raise RuntimeError(
+                        "Llama.eval(decode): Native speculative verification must "
+                        "fit in one successful target decode"
+                    )
                 raise RuntimeError("Llama.eval(decode): Failed completely even with batch size 1.")
 
             # Save successfully processed tokens into the Python-side ledger
@@ -1654,6 +1763,14 @@ class Llama:
             The generated tokens.
         """
         original_tokens = list(tokens)
+        native_speculative = self._native_speculative
+        if native_speculative is not None:
+            if logits_processor is not None:
+                raise ValueError(
+                    "Custom logits_processor callbacks are not supported by "
+                    "experimental native speculative decoding"
+                )
+
         # Check for kv cache prefix match
         if reset and self.n_tokens > 0:
             # 1. First, check for a 100% exact match of the entire sequence
@@ -1699,7 +1816,25 @@ class Llama:
                     # Physically erase trailing "ghost" tokens from the C++ KV cache
                     # to prevent attention misalignment in multi-round chats.
                     if longest_prefix < self.n_tokens:
-                        if self.is_hybrid and self._hybrid_cache_mgr is not None:
+                        if native_speculative is not None:
+                            if self.verbose:
+                                print(
+                                    "Llama.generate: Truncating target and native "
+                                    f"draft contexts to {longest_prefix}.",
+                                    file=sys.stderr,
+                                )
+                            try:
+                                self._native_speculative_truncate(longest_prefix)
+                                self.n_tokens = longest_prefix
+                                tokens = tokens[longest_prefix:]
+                            except RuntimeError:
+                                # Prefix changes can exceed the bounded recurrent
+                                # rollback window. Re-prefill both contexts instead.
+                                self._ctx.memory_clear(True)
+                                native_speculative.clear()
+                                self.n_tokens = 0
+                                tokens = original_tokens
+                        elif self.is_hybrid and self._hybrid_cache_mgr is not None:
                             if self.verbose:
                                 print(f"Llama.generate: Hybrid model rollback triggered.", file=sys.stderr)
 
@@ -1739,6 +1874,8 @@ class Llama:
             # No prefix matched at all. Completely clear the KV cache to prevent context poisoning.
             self.n_tokens = 0
             self._ctx.memory_clear(True)
+            if native_speculative is not None:
+                native_speculative.clear()
             if self.is_hybrid and self._hybrid_cache_mgr is not None:
                 self._hybrid_cache_mgr.clear()
             if self.verbose:
@@ -1837,11 +1974,15 @@ class Llama:
         copy_logits = (
             self._logits_all
             or logits_processor is not None
-            or stopping_criteria is not None
+            or (stopping_criteria is not None and native_speculative is None)
         )
 
         sample_idx = self.n_tokens + len(tokens) - 1
         tokens = list(tokens)
+        native_begun = False
+        native_draft_len = 0
+        native_draft_start = 0
+        native_block_decoded = False
 
         # Main evaluation and generation loop
         try:
@@ -1852,6 +1993,7 @@ class Llama:
                     # ONLY apply this if rollback capabilities are enabled (max_checkpoints > 0).
                     if (
                         self.is_hybrid
+                        and native_speculative is None
                         and self._hybrid_cache_mgr is not None
                         and self._hybrid_cache_mgr.max_checkpoints > 0
                         and len(tokens) > 1
@@ -1883,27 +2025,101 @@ class Llama:
                         )
                     else:
                         # Standard evaluation or single-token generation step
-                        self.eval(
-                            tokens,
-                            active_loras=active_loras,
-                            control_vector=control_vector,
-                            copy_logits=copy_logits,
+                        native_verification = (
+                            native_speculative is not None and native_draft_len > 0
                         )
+                        verification_base = self.n_tokens
+                        try:
+                            self.eval(
+                                tokens,
+                                active_loras=active_loras,
+                                control_vector=control_vector,
+                                copy_logits=copy_logits and not native_verification,
+                                output_all=native_verification,
+                                require_atomic=native_verification,
+                            )
+                            if native_verification:
+                                native_block_decoded = True
+                        except BaseException:
+                            if native_verification:
+                                try:
+                                    native_speculative.accept(0)
+                                    self._native_speculative_truncate(verification_base)
+                                    self.n_tokens = verification_base
+                                finally:
+                                    native_draft_len = 0
+                                    native_block_decoded = False
+                            raise
 
                 # Sample loop
                 while sample_idx < self.n_tokens:
                     if self._abort_event.is_set():
                         return
 
-                    token = self._sampling_ctx.sample(self._ctx, idx=-1)
+                    # Each speculative verification row predicts the following
+                    # token. Negative indexing maps sample_idx to the matching
+                    # output row of the most recent target decode.
+                    output_idx = sample_idx - self.n_tokens
+                    stopping_logits = None
+                    if native_speculative is not None and stopping_criteria is not None:
+                        # Native verification keeps all output rows in the target
+                        # context instead of copying them into self._scores. Give
+                        # callbacks a view of the exact row about to be sampled.
+                        logits_ptr = self._ctx.get_logits_ith(output_idx)
+                        stopping_logits = np.ctypeslib.as_array(
+                            logits_ptr, shape=(self._n_vocab,)
+                        )
+
+                    token = self._sampling_ctx.sample(self._ctx, idx=output_idx)
                     self._sampling_ctx.accept(token, False if grammar is None else True)
 
                     sample_idx += 1
 
+                    native_mismatch = False
+                    if (
+                        native_speculative is not None
+                        and native_draft_len > 0
+                        and native_block_decoded
+                    ):
+                        native_mismatch = (
+                            sample_idx < self.n_tokens
+                            and token != self._input_ids[sample_idx]
+                        )
+                        if native_mismatch:
+                            accepted = max(
+                                0,
+                                min(
+                                    native_draft_len,
+                                    sample_idx - native_draft_start,
+                                ),
+                            )
+                            native_speculative.accept(accepted)
+                            self._native_speculative_truncate(sample_idx)
+                            self.n_tokens = sample_idx
+                            native_draft_len = 0
+                            native_block_decoded = False
+                        elif sample_idx >= native_draft_start + native_draft_len - 1:
+                            # Every drafted token matched. The remaining final
+                            # output row produces the normal bonus token.
+                            native_speculative.accept(native_draft_len)
+                            native_draft_len = 0
+                            native_block_decoded = False
+
                     if stopping_criteria is not None:
+                        criteria_input_ids = self._input_ids[:sample_idx]
+                        criteria_logits = self._scores[
+                            0 if not self._logits_all else sample_idx - 1, :
+                        ]
+                        if native_speculative is not None:
+                            # The sampled token is not written to input_ids until
+                            # the next eval. Include it so token-based chat-template
+                            # stop criteria observe it without a one-token delay.
+                            criteria_input_ids = np.append(criteria_input_ids, token)
+                            assert stopping_logits is not None
+                            criteria_logits = stopping_logits
                         if stopping_criteria(
-                            self._input_ids[: sample_idx],
-                            self._scores[0 if not self._logits_all else sample_idx - self.n_tokens, :]
+                            criteria_input_ids,
+                            criteria_logits,
                         ):
                             return
 
@@ -1916,9 +2132,16 @@ class Llama:
                     if tokens_or_none is not None:
                         tokens.extend(tokens_or_none)
 
+                    if native_mismatch:
+                        break
+
                     # Rollback Check: A previously evaluated token (e.g. from speculative decoding)
                     # mismatched the newly sampled token. We must rollback the KV cache.
-                    if sample_idx < self.n_tokens and token != self._input_ids[sample_idx]:
+                    if (
+                        native_speculative is None
+                        and sample_idx < self.n_tokens
+                        and token != self._input_ids[sample_idx]
+                    ):
                         self.n_tokens = sample_idx
                         if self.is_hybrid:
                             if self.verbose:
@@ -1940,7 +2163,48 @@ class Llama:
 
                 # Speculative Decoding (Draft Model) logic
                 if self.draft_model is not None:
-                    if self.is_hybrid:
+                    if native_speculative is not None:
+                        # The send() extension can append caller-provided tokens.
+                        # Evaluate those normally and only draft from one freshly
+                        # sampled id_last in this experimental path.
+                        if len(tokens) == 1:
+                            self.input_ids[
+                                self.n_tokens : self.n_tokens + len(tokens)
+                            ] = tokens
+                            if not native_begun:
+                                native_speculative._begin(
+                                    self.input_ids[: self.n_tokens]
+                                )
+                                native_begun = True
+
+                            remaining_context = (
+                                self._n_ctx - self.n_tokens - len(tokens)
+                            )
+                            # DFlash builds its configured noise block before
+                            # the common layer applies the per-call result cap.
+                            # Do not start a shortened block at the context edge.
+                            draft_capacity = (
+                                native_speculative.max_draft_tokens
+                                if remaining_context
+                                >= native_speculative.max_draft_tokens
+                                else 0
+                            )
+                            if draft_capacity > 0:
+                                draft_tokens = native_speculative(
+                                    self.input_ids[
+                                        : self.n_tokens + len(tokens)
+                                    ],
+                                    max_tokens=draft_capacity,
+                                )
+                                if len(draft_tokens) > 0:
+                                    native_draft_start = self.n_tokens + len(tokens)
+                                    native_draft_len = len(draft_tokens)
+                                    native_block_decoded = False
+                                    # ndarray iteration yields NumPy scalar types,
+                                    # while eval deliberately accepts only Python
+                                    # ints at the native boundary.
+                                    tokens.extend(draft_tokens.astype(int).tolist())
+                    elif self.is_hybrid:
                         if self.verbose:
                             print("Llama.generate: Speculative decoding is skipped for Hybrid models.", file=sys.stderr)
                     else:
@@ -1951,9 +2215,31 @@ class Llama:
                         tokens.extend(
                             draft_tokens.astype(int)[
                                 : self._n_ctx - self.n_tokens - len(tokens)
-                            ]
+                            ].tolist()
                         )
         finally:
+            if native_speculative is not None and native_draft_len > 0:
+                try:
+                    if native_block_decoded:
+                        accepted = max(
+                            0,
+                            min(
+                                native_draft_len,
+                                sample_idx - native_draft_start + 1,
+                            ),
+                        )
+                        cutoff = native_draft_start + accepted
+                        native_speculative.accept(accepted)
+                        self._native_speculative_truncate(cutoff)
+                        self.n_tokens = cutoff
+                    else:
+                        native_speculative.accept(0)
+                except Exception as exc:
+                    warnings.warn(
+                        f"Failed to clean up native speculative state: {exc}",
+                        RuntimeWarning,
+                    )
+
             # Ensure the final state is checkpointed for hybrid models when generation finishes or is interrupted
             if (
                 self.is_hybrid
@@ -3525,6 +3811,11 @@ prompt: The prompt to generate text from.
         self.__init__(**state)
 
     def save_state(self) -> LlamaState:
+        if self._native_speculative is not None:
+            raise RuntimeError(
+                "save_state() is not supported with experimental native "
+                "speculative decoding because the draft context is not serialized"
+            )
         if self.verbose:
             print("Llama.save_state: saving llama state", file=sys.stderr)
 
@@ -3568,6 +3859,11 @@ prompt: The prompt to generate text from.
         )
 
     def load_state(self, state: LlamaState) -> None:
+        if self._native_speculative is not None:
+            raise RuntimeError(
+                "load_state() is not supported with experimental native "
+                "speculative decoding because the draft context is not serialized"
+            )
         # Restore metadata: input tokens, token count, and RNG seed.
         self.input_ids = state.input_ids.copy()
         self.n_tokens = state.n_tokens

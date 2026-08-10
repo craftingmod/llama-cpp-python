@@ -299,6 +299,18 @@ if (LLAMA_BUILD)
 
     add_subdirectory(vendor/llama.cpp)
 
+    # Experimental C ABI bridge for llama.cpp/common speculative decoders.
+    # Keeping the bridge in llama-common lets Python reuse the upstream DFlash
+    # and DSpark implementations without duplicating them.
+    if (TARGET llama-common)
+        target_sources(llama-common PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/llama_cpp/native/llama_cpp_native_speculative.cpp"
+        )
+        target_include_directories(llama-common PRIVATE
+            "${CMAKE_CURRENT_SOURCE_DIR}/llama_cpp/native"
+        )
+    endif()
+
     if (WIN32 AND TARGET llama)
         set_target_properties(llama PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
     endif()

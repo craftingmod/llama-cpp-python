@@ -1902,6 +1902,66 @@ However, it uses a legacy NumPy sliding-window lookup and may have higher overhe
 * It is especially useful for code generation, structured text, repeated templates, and boilerplate-heavy completions.
 * `LlamaNGramMapDecoding` stores internal Python-side history and indexes. If you want to reuse the same decoder instance for an unrelated generation, call `draft_model.clear()`.
 
+#### Experimental native GGUF draft models
+
+This branch also exposes an experimental bridge to the speculative decoders in
+the bundled `llama.cpp` `llama-common` library. Unlike prompt lookup, this mode
+loads a second GGUF model and lets `llama.cpp` maintain its draft context.
+
+The following example uses the target and DFlash files from
+[`meta-models/Muse-Glimmer-30B-GGUF`](https://huggingface.co/meta-models/Muse-Glimmer-30B-GGUF):
+
+```python
+from llama_cpp import Llama, llama_flash_attn_type
+from llama_cpp.llama_speculative import LlamaNativeSpeculativeDecoding
+
+draft = LlamaNativeSpeculativeDecoding(
+    model_path="models/dflash-kquant.gguf",
+    spec_type="draft-dflash",
+    n_gpu_layers="all",
+    n_max=15,
+)
+
+llm = Llama(
+    model_path="models/muse-glimmer-30B-kquant-17gb.gguf",
+    draft_model=draft,
+    n_gpu_layers="all",
+    n_ctx=16384,
+    n_batch=2048,
+    n_ubatch=512,
+    flash_attn_type=(
+        llama_flash_attn_type.LLAMA_FLASH_ATTN_TYPE_ENABLED
+    ),
+)
+
+try:
+    response = llm.create_chat_completion(
+        messages=[
+            {
+                "role": "user",
+                "content": "Implement an LRU cache in Python.",
+            }
+        ],
+        temperature=1.0,
+        top_p=0.95,
+    )
+    print(response["choices"][0]["message"]["content"])
+finally:
+    llm.close()
+```
+
+This native path is intentionally experimental. Its Python and C ABI may change,
+and it currently supports one text sequence at a time. The target GGUF and draft
+GGUF must be a compatible pair trained for each other. Multimodal prompt chunks
+(`mmproj`, image, audio, or video input) are not yet synchronized with the draft
+context. Python-side `Llama` state caches and save/load state operations also do
+not include the draft context, so do not combine them with native speculative
+decoding. Context shifting and custom Python `logits_processor` callbacks are
+also disabled in this first version. A wheel
+built with this experimental `llama-common` bridge is required; older wheels do
+not provide the needed native symbols. `draft-dspark` uses the same API when a
+compatible DSpark GGUF pair is available.
+
 ---
 
 ## Docker image
