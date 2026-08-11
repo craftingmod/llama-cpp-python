@@ -311,11 +311,6 @@ class Llama:
                 raise ValueError(
                     "Experimental native speculative decoding only supports n_seq_max=1"
                 )
-            if mmproj_path is not None:
-                raise ValueError(
-                    "Experimental native speculative decoding is text-only; "
-                    "mmproj_path is not supported"
-                )
 
         configure_logging(
             verbose=verbose,
@@ -792,11 +787,13 @@ class Llama:
             if self.chat_handler is not None and self.verbose:
                 print("Warning: Both `chat_handler` and `mmproj_path` are not null. Chat handler will be overwritten.", flush = True)
 
+            mtmd_handler_kwargs = dict(chat_handler_kwargs)
+            mtmd_handler_kwargs.setdefault("verbose", self.verbose)
             self.chat_handler = llama_multimodal.GenericMTMDChatHandler(
                 chat_format = self.metadata.get("tokenizer.chat_template", None),
                 mmproj_path = mmproj_path,
                 chat_template_name=chat_template_name,
-                **chat_handler_kwargs
+                **mtmd_handler_kwargs
             )
 
         if self.verbose:
@@ -1776,16 +1773,24 @@ class Llama:
             # 1. First, check for a 100% exact match of the entire sequence
             full_match_prefix = self.longest_token_prefix(self._input_ids, tokens, self.verbose)
 
-            # --- FAST PATH: Zero-latency bypass for Hybrid Single-Turn & Multimodal ---
-            # If the cache is disabled (max_checkpoints <= 0) and we have a 100% match,
-            # we completely skip the N-1 truncation. This ensures that multimodal handlers
-            # (which just finished evaluating and already hold fresh logits) don't trigger
-            # unnecessary N-1 rollbacks or catastrophic KV cache clears.
+            # --- FAST PATH: pre-evaluated native or hybrid multimodal prompt ---
+            # Native MTMD ledgers contain negative media placeholders that must never
+            # enter token eval. A full match means the handler has already evaluated
+            # the prompt and synchronized every target batch with the draft context,
+            # so sample directly from the fresh final logits.
             if (
                 full_match_prefix == len(tokens)
                 and full_match_prefix == self.n_tokens
-                and self.is_hybrid
-                and (self._hybrid_cache_mgr is None or self._hybrid_cache_mgr.max_checkpoints <= 0)
+                and (
+                    native_speculative is not None
+                    or (
+                        self.is_hybrid
+                        and (
+                            self._hybrid_cache_mgr is None
+                            or self._hybrid_cache_mgr.max_checkpoints <= 0
+                        )
+                    )
+                )
             ):
                 reset = False
                 longest_prefix = len(tokens)

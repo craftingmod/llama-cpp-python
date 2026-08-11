@@ -1924,6 +1924,7 @@ draft = LlamaNativeSpeculativeDecoding(
 
 llm = Llama(
     model_path="models/muse-glimmer-30B-kquant-17gb.gguf",
+    mmproj_path="models/mmproj-Muse-Glimmer-30B-Q8_0.gguf",
     draft_model=draft,
     n_gpu_layers="all",
     n_ctx=16384,
@@ -1939,11 +1940,19 @@ try:
         messages=[
             {
                 "role": "user",
-                "content": "Implement an LRU cache in Python.",
+                "content": [
+                    {
+                        "type": "image",
+                        "image": "path/to/image.jpg",
+                    },
+                    {
+                        "type": "text",
+                        "text": "Describe this image in one sentence.",
+                    },
+                ],
             }
         ],
-        temperature=1.0,
-        top_p=0.95,
+        temperature=0.0,
     )
     print(response["choices"][0]["message"]["content"])
 finally:
@@ -1951,16 +1960,22 @@ finally:
 ```
 
 This native path is intentionally experimental. Its Python and C ABI may change,
-and it currently supports one text sequence at a time. The target GGUF and draft
-GGUF must be a compatible pair trained for each other. Multimodal prompt chunks
-(`mmproj`, image, audio, or video input) are not yet synchronized with the draft
-context. Python-side `Llama` state caches and save/load state operations also do
-not include the draft context, so do not combine them with native speculative
-decoding. Context shifting and custom Python `logits_processor` callbacks are
-also disabled in this first version. A wheel
-built with this experimental `llama-common` bridge is required; older wheels do
+and it currently supports one sequence at a time. The target GGUF, draft GGUF,
+and optional `mmproj` must be compatible companion artifacts. Native speculative
+image input is supported through `GenericMTMDChatHandler`: every successful target
+embedding decode batch is immediately mirrored into the draft context before the
+next target decode. Audio and video are not yet supported by this native path.
+
+Each native multimodal request performs a full target-and-draft re-prefill. Media
+prefix reuse, media rollback, multimodal context shifting, and multimodal Python
+state save/load are intentionally disabled; increase `n_ctx` if the complete
+prompt does not fit. Python-side `Llama` state caches still do not include the
+draft context, and custom Python `logits_processor` callbacks remain unsupported.
+A wheel built with this experimental `llama-common` bridge is required; older wheels do
 not provide the needed native symbols. `draft-dspark` uses the same API when a
-compatible DSpark GGUF pair is available.
+compatible DSpark GGUF pair is available. The end-to-end comparison utility at
+`scripts/native_speculative_vision_hello.py` runs target-only first, releases it,
+then runs native speculative image generation and prints draft/accept statistics.
 
 ---
 

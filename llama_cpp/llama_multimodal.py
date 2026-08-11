@@ -5,6 +5,7 @@ import ctypes
 import json
 import os
 import sys
+import warnings
 import zlib
 
 from contextlib import ExitStack
@@ -1057,11 +1058,47 @@ class MTMDChatHandler:
         if self.verbose:
             print(f"{self.log_prefix}(__call__): Prepared virtual token ledger of length {len(full_prompt_ids)}.", file=sys.stderr)
 
+        native_speculative = llama._native_speculative
+        native_multimodal = native_speculative is not None and any(
+            self._is_image_chunk(chunk_type) or self._is_audio_chunk(chunk_type)
+            for _, _, _, chunk_type, _ in chunk_token_spans
+        )
+
         try:
             # 3. KV Cache Synchronization & State Rollback
             # Compares the virtual ledger with physical history to prevent Cache Poisoning.
-            current_history = llama.input_ids[:llama.n_tokens].tolist()
-            longest_prefix = llama.longest_token_prefix(current_history, full_prompt_ids, self.verbose)
+            if native_multimodal:
+                has_non_image_input = any(
+                    item["type"] != "image"
+                    for item in self._get_media_items(messages)
+                ) or any(
+                    self._is_audio_chunk(chunk_type)
+                    for _, _, _, chunk_type, _ in chunk_token_spans
+                )
+                if has_non_image_input:
+                    raise ValueError(
+                        "Experimental native speculative multimodal decoding "
+                        "currently supports image input only"
+                    )
+
+                # Native draft state cannot follow target-only prefix reuse, media
+                # rollback, context shifting, or hybrid checkpoints. Start every
+                # request containing media from two empty, position-aligned contexts.
+                self._reset_native_multimodal_contexts(llama)
+                if len(full_prompt_ids) > llama.n_ctx():
+                    raise RuntimeError(
+                        "Experimental native speculative multimodal prefill does "
+                        f"not support context shifting: prompt requires "
+                        f"{len(full_prompt_ids)} slots but n_ctx={llama.n_ctx()}. "
+                        "Increase n_ctx or shorten the request."
+                    )
+                current_history = []
+                longest_prefix = 0
+            else:
+                current_history = llama.input_ids[:llama.n_tokens].tolist()
+                longest_prefix = llama.longest_token_prefix(
+                    current_history, full_prompt_ids, self.verbose
+                )
 
             if longest_prefix < llama.n_tokens:
                 if llama.is_hybrid and llama._hybrid_cache_mgr is not None:
@@ -1130,7 +1167,13 @@ class MTMDChatHandler:
 
                     # Stage 5: Multimodal Physical OOM Defense
                     if n_past + chunk_n_tokens > llama.n_ctx():
-                        if not llama._ctx.memory_can_shift():
+                        if native_multimodal:
+                            raise RuntimeError(
+                                "Experimental native speculative multimodal prefill "
+                                "does not support context shifting; increase n_ctx "
+                                "or shorten the request"
+                            )
+                        elif not llama._ctx.memory_can_shift():
                             raise RuntimeError(
                                 f"{self.log_prefix}(__call__): Context Shift is explicitly disabled by the C++ backend "
                                 f"(n_pos_per_embd > 1 or incompatible M-RoPE). "
@@ -1161,25 +1204,33 @@ class MTMDChatHandler:
                             n_past -= n_discard
                             llama.n_tokens = n_past
 
-                    # Execute C++ Multimodal Black-box Extraction
-                    new_n_past = llama_cpp_lib.llama_pos(0)
-                    result = self._mtmd_cpp.mtmd_helper_eval_chunk_single(
-                        self.mtmd_ctx,
-                        llama._ctx.ctx,
-                        chunk_ptr,
-                        llama_cpp_lib.llama_pos(n_past),
-                        llama_cpp_lib.llama_seq_id(0),
-                        llama.n_batch,
-                        True, # logits_last = True, drastically saves computational overhead
-                        ctypes.byref(new_n_past)
-                    )
+                    if native_multimodal:
+                        new_n_past_value = self._eval_native_media_chunk(
+                            llama=llama,
+                            chunk_ptr=chunk_ptr,
+                            n_past=n_past,
+                        )
+                    else:
+                        # Keep the established black-box path for non-native use.
+                        new_n_past = llama_cpp_lib.llama_pos(0)
+                        result = self._mtmd_cpp.mtmd_helper_eval_chunk_single(
+                            self.mtmd_ctx,
+                            llama._ctx.ctx,
+                            chunk_ptr,
+                            llama_cpp_lib.llama_pos(n_past),
+                            llama_cpp_lib.llama_seq_id(0),
+                            llama.n_batch,
+                            True, # logits_last = True, drastically saves computational overhead
+                            ctypes.byref(new_n_past)
+                        )
 
-                    if result != 0:
-                        raise ValueError(f"{self.log_prefix}(mtmd_helper_eval_chunk_single): Media evaluation failed with error code {result}.")
+                        if result != 0:
+                            raise ValueError(f"{self.log_prefix}(mtmd_helper_eval_chunk_single): Media evaluation failed with error code {result}.")
+                        new_n_past_value = new_n_past.value
 
                     # Update Ledger with "Negative Reverse Vocabulary" IDs
-                    llama.input_ids[n_past : new_n_past.value] = media_id
-                    n_past = new_n_past.value
+                    llama.input_ids[n_past : new_n_past_value] = media_id
+                    n_past = new_n_past_value
                     llama.n_tokens = n_past
 
             # Extract the final, perfectly synchronized prompt sequence
@@ -1188,7 +1239,8 @@ class MTMDChatHandler:
             # End-of-Turn Checkpoint
             # Anchors the state ONLY after the entire multi-modal turn is processed
             if (
-                llama.is_hybrid
+                not native_multimodal
+                and llama.is_hybrid
                 and llama._hybrid_cache_mgr is not None
                 and llama._hybrid_cache_mgr.max_checkpoints > 0
             ):
@@ -1200,6 +1252,10 @@ class MTMDChatHandler:
                     tokens=prompt,
                     seq_id=0
                 )
+        except BaseException:
+            if native_multimodal:
+                self._cleanup_failed_native_multimodal_prefill(llama)
+            raise
         finally:
             # Cleanup chunks
             if chunks is not None:
@@ -1310,6 +1366,152 @@ class MTMDChatHandler:
                 tool_name, completion_or_chunks, stream
             )
         return _convert_completion_to_chat(completion_or_chunks, stream=stream)
+
+    def _reset_native_multimodal_contexts(self, llama: llama_core.Llama) -> None:
+        """Clear target, native draft, and target-only checkpoint state together."""
+        native_speculative = llama._native_speculative
+        if native_speculative is None:
+            raise RuntimeError("Native speculative decoder is not configured")
+
+        first_error: Optional[BaseException] = None
+        try:
+            llama._ctx.memory_clear(True)
+        except BaseException as exc:
+            first_error = exc
+
+        try:
+            native_speculative.clear()
+        except BaseException as exc:
+            if first_error is None:
+                first_error = exc
+            else:
+                warnings.warn(
+                    f"Native draft context clear also failed: {exc}",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+
+        hybrid_cache_mgr = getattr(llama, "_hybrid_cache_mgr", None)
+        if hybrid_cache_mgr is not None:
+            try:
+                hybrid_cache_mgr.clear()
+            except BaseException as exc:
+                if first_error is None:
+                    first_error = exc
+                else:
+                    warnings.warn(
+                        f"Hybrid checkpoint clear also failed: {exc}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+
+        # Never leave the Python ledger pointing at state that has been cleared.
+        llama.n_tokens = 0
+        if first_error is not None:
+            raise RuntimeError(
+                "Failed to clear target and native draft contexts before "
+                "multimodal prefill"
+            ) from first_error
+
+    def _cleanup_failed_native_multimodal_prefill(
+        self, llama: llama_core.Llama
+    ) -> None:
+        """Best-effort cleanup that cannot hide the original prefill exception."""
+        try:
+            self._reset_native_multimodal_contexts(llama)
+        except BaseException as exc:
+            warnings.warn(
+                "Failed to fully clear target/native state after multimodal "
+                f"prefill failure: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    def _eval_native_media_chunk(
+        self,
+        *,
+        llama: llama_core.Llama,
+        chunk_ptr: Any,
+        n_past: int,
+    ) -> int:
+        """Encode one media chunk and mirror every successful target batch."""
+        native_speculative = llama._native_speculative
+        if native_speculative is None:
+            raise RuntimeError("Native speculative decoder is not configured")
+
+        mtmd_batch = self._mtmd_cpp.mtmd_batch_init(self.mtmd_ctx)
+        if not mtmd_batch:
+            raise RuntimeError(
+                "MTMD media batch initialization failed (possibly out of memory)"
+            )
+
+        callback_error: Optional[BaseException] = None
+
+        @self._mtmd_cpp.mtmd_helper_post_decode_callback
+        def post_decode(batch, user_data):
+            del user_data
+            nonlocal callback_error
+            try:
+                # The target-layer extraction buffer is valid only until the next
+                # target decode, so process this exact embedding batch immediately.
+                native_speculative._process_batch(batch)
+                return 0
+            except BaseException as exc:
+                callback_error = exc
+                return 1
+
+        try:
+            result = self._mtmd_cpp.mtmd_batch_add_chunk(mtmd_batch, chunk_ptr)
+            if result != 0:
+                raise ValueError(
+                    "MTMD media batch add failed "
+                    f"with error code {result}"
+                )
+
+            result = self._mtmd_cpp.mtmd_batch_encode(mtmd_batch)
+            if result != 0:
+                raise ValueError(
+                    "MTMD media encode failed "
+                    f"with error code {result} (possibly out of memory)"
+                )
+
+            encoded_embd = self._mtmd_cpp.mtmd_batch_get_output_embd(
+                mtmd_batch, chunk_ptr
+            )
+            if not encoded_embd:
+                raise RuntimeError(
+                    "MTMD media encode produced no output embeddings"
+                )
+
+            new_n_past = llama_cpp_lib.llama_pos(0)
+            result = self._mtmd_cpp.mtmd_helper_decode_image_chunk(
+                self.mtmd_ctx,
+                llama._ctx.ctx,
+                chunk_ptr,
+                encoded_embd,
+                llama_cpp_lib.llama_pos(n_past),
+                llama_cpp_lib.llama_seq_id(0),
+                llama.n_batch,
+                ctypes.byref(new_n_past),
+                post_decode,
+                ctypes.c_void_p(),
+            )
+
+            # ctypes callbacks must not propagate Python exceptions through C.
+            # Re-raise the original exception only after the helper returns.
+            if callback_error is not None:
+                raise callback_error
+            if result != 0:
+                raise ValueError(
+                    "MTMD target media decode failed "
+                    f"with error code {result} (possibly out of memory)"
+                )
+
+            return int(new_n_past.value)
+        finally:
+            # Keep both the callback closure and encoded embeddings alive through
+            # the native helper call, then release the MTMD batch exactly once.
+            self._mtmd_cpp.mtmd_batch_free(mtmd_batch)
 
     def load_media(self, media_url: str, media_type: str) -> bytes:
         """
@@ -1586,6 +1788,9 @@ class GenericMTMDChatHandler(MTMDChatHandler):
         "<|image|>",
         "<|audio|>",
         "<|video|>",
+
+        # Muse Glimmer image placeholder.
+        "<|patch|>",
 
         # LLaVA / LFM / Mistral-style placeholders.
         "<image>",

@@ -575,6 +575,63 @@ def test_native_generation_samples_each_verification_row_and_rolls_back(
     generation.close()
 
 
+def test_native_generation_full_match_never_evaluates_media_placeholders(
+    monkeypatch,
+):
+    native = _GenerationNative()
+    context = _GenerationContext()
+    eval_calls = []
+
+    llm = object.__new__(Llama)
+    llm._native_speculative = native
+    llm.draft_model = native
+    llm._ctx = context
+    llm._model = object()
+    llm._hybrid_cache_mgr = None
+    llm.is_hybrid = False
+    llm.verbose = False
+    llm.n_tokens = 3
+    llm._n_ctx = 32
+    llm._n_vocab = 256
+    llm.input_ids = np.empty(32, dtype=np.intc)
+    llm.input_ids[:3] = [10, -123, 20]
+    llm.scores = np.empty((1, 256), dtype=np.single)
+    llm._logits_all = False
+    llm._sampling_ctx = None
+    llm._seed = 123
+    llm._abort_event = threading.Event()
+
+    def fake_eval(
+        self,
+        tokens,
+        active_loras=None,
+        control_vector=None,
+        copy_logits=True,
+        output_all=False,
+        require_atomic=False,
+    ):
+        tokens = list(tokens)
+        eval_calls.append(tokens)
+        assert all(token >= 0 for token in tokens)
+        start = self.n_tokens
+        self.input_ids[start : start + len(tokens)] = tokens
+        self.n_tokens += len(tokens)
+
+    llm.eval = MethodType(fake_eval, llm)
+    _GenerationSampler.outputs = [21, 30]
+    _GenerationSampler.indices = []
+    monkeypatch.setattr(llama_module, "LlamaSamplingContext", _GenerationSampler)
+
+    generation = llm.generate([10, -123, 20], reset=True, temp=0.0)
+    assert next(generation) == 21
+    assert eval_calls == []
+    assert next(generation) == 30
+
+    assert native.begins == [[10, -123, 20]]
+    assert eval_calls == [[21, 30, 40]]
+    generation.close()
+
+
 def test_native_generation_supports_token_stopping_criteria(monkeypatch):
     native = _GenerationNative()
     context = _GenerationContext()
