@@ -1063,11 +1063,21 @@ class MTMDChatHandler:
             self._is_image_chunk(chunk_type) or self._is_audio_chunk(chunk_type)
             for _, _, _, chunk_type, _ in chunk_token_spans
         )
+        cleanup_native_on_failure = native_multimodal
 
         try:
             # 3. KV Cache Synchronization & State Rollback
             # Compares the virtual ledger with physical history to prevent Cache Poisoning.
             if native_multimodal:
+                if not getattr(native_speculative, "supports_multimodal", True):
+                    # The MTP implementation currently ignores embedding batches.
+                    # Reject before clearing or decoding either context so an
+                    # existing text prefix remains usable.
+                    cleanup_native_on_failure = False
+                    raise ValueError(
+                        "draft-mtp currently supports text-only generation; "
+                        "image and audio input are not supported"
+                    )
                 has_non_image_input = any(
                     item["type"] != "image"
                     for item in self._get_media_items(messages)
@@ -1257,7 +1267,7 @@ class MTMDChatHandler:
                     seq_id=0
                 )
         except BaseException:
-            if native_multimodal:
+            if cleanup_native_on_failure:
                 self._cleanup_failed_native_multimodal_prefill(llama)
             raise
         finally:

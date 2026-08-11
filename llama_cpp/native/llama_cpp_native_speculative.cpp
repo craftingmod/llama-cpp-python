@@ -2,9 +2,13 @@
 
 #include "common.h"
 #include "llama.h"
+#include "log.h"
 #include "speculative.h"
 
+#include "../../vendor/llama.cpp/src/llama-ext.h"
+
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <memory>
@@ -16,6 +20,7 @@ struct llama_cpp_native_speculative {
     common_params params;
     common_speculative_init_result_ptr draft_init;
     common_speculative * speculative = nullptr;
+    common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE;
 
     llama_context * target_context = nullptr;
     llama_context * draft_context  = nullptr;
@@ -24,6 +29,8 @@ struct llama_cpp_native_speculative {
     llama_tokens result;
     std::string last_error;
     bool has_last_draft = false;
+    bool last_draft_verified = false;
+    bool shares_target_memory = false;
 
     ~llama_cpp_native_speculative() {
         if (speculative != nullptr) {
@@ -58,6 +65,7 @@ bool set_error(llama_cpp_native_speculative * speculative, const std::string & m
 
 bool is_supported_type(common_speculative_type type) {
     switch (type) {
+        case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
         case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
         case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
             return true;
@@ -90,11 +98,71 @@ bool validate_batch(llama_cpp_native_speculative * speculative, const llama_batc
     if ((batch.token == nullptr) == (batch.embd == nullptr)) {
         return set_error(speculative, "target batch must contain exactly one of tokens or embeddings");
     }
+    if (speculative->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP && batch.embd != nullptr) {
+        return set_error(
+                speculative,
+                "draft-mtp currently supports text token batches only; multimodal embeddings are unsupported");
+    }
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
         if (batch.n_seq_id[i] != 1 || batch.seq_id[i] == nullptr || batch.seq_id[i][0] != 0) {
             return set_error(speculative, "experimental native speculative decoding only supports sequence 0");
         }
     }
+    return true;
+}
+
+std::string model_architecture(const llama_model * model) {
+    char value[64] = {};
+    if (llama_model_meta_val_str(model, "general.architecture", value, sizeof(value)) < 0) {
+        return {};
+    }
+    return value;
+}
+
+bool mtp_vocabs_are_compatible(
+        const llama_model * target_model,
+        const llama_model * draft_model,
+        std::string & reason) {
+    const llama_vocab * target_vocab = llama_model_get_vocab(target_model);
+    const llama_vocab * draft_vocab  = llama_model_get_vocab(draft_model);
+
+    if (target_vocab == nullptr || draft_vocab == nullptr) {
+        reason = "target or assistant vocabulary is unavailable";
+        return false;
+    }
+    if (llama_vocab_type(target_vocab) != llama_vocab_type(draft_vocab)) {
+        reason = "target and assistant vocabulary types differ";
+        return false;
+    }
+    if (llama_vocab_get_add_bos(target_vocab) != llama_vocab_get_add_bos(draft_vocab) ||
+        (llama_vocab_get_add_bos(target_vocab) &&
+         llama_vocab_bos(target_vocab) != llama_vocab_bos(draft_vocab))) {
+        reason = "target and assistant BOS configuration differs";
+        return false;
+    }
+    if (llama_vocab_get_add_eos(target_vocab) != llama_vocab_get_add_eos(draft_vocab) ||
+        (llama_vocab_get_add_eos(target_vocab) &&
+         llama_vocab_eos(target_vocab) != llama_vocab_eos(draft_vocab))) {
+        reason = "target and assistant EOS configuration differs";
+        return false;
+    }
+
+    const int32_t n_target = llama_vocab_n_tokens(target_vocab);
+    const int32_t n_draft  = llama_vocab_n_tokens(draft_vocab);
+    if (std::abs(n_target - n_draft) > 128) {
+        reason = "target and assistant vocabulary sizes differ by more than 128 tokens";
+        return false;
+    }
+
+    for (int32_t token = 5; token < std::min(n_target, n_draft); ++token) {
+        const char * target_text = llama_vocab_get_text(target_vocab, token);
+        const char * draft_text  = llama_vocab_get_text(draft_vocab, token);
+        if (target_text == nullptr || draft_text == nullptr || std::strcmp(target_text, draft_text) != 0) {
+            reason = "target and assistant token text differs at token " + std::to_string(token);
+            return false;
+        }
+    }
+
     return true;
 }
 
@@ -146,6 +214,7 @@ llama_cpp_native_speculative * llama_cpp_native_speculative_init(
 
         auto result = std::make_unique<llama_cpp_native_speculative>();
         result->target_context = target_context;
+        result->type           = type;
 
         common_params & base = result->params;
         base.n_ctx      = params->n_ctx > 0 ? params->n_ctx : (int32_t) llama_n_ctx(target_context);
@@ -188,6 +257,55 @@ llama_cpp_native_speculative * llama_cpp_native_speculative_init(
         result->draft_context     = result->draft_init->context();
         if (draft_model == nullptr || result->draft_context == nullptr) {
             throw std::runtime_error(std::string("failed to load draft model: ") + params->model_path);
+        }
+
+        if (type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            const std::string target_arch = model_architecture(target_model);
+            const std::string draft_arch  = model_architecture(draft_model);
+            if (target_arch != "gemma4") {
+                throw std::runtime_error(
+                        "external draft-mtp currently requires a Gemma 4 target "
+                        "(general.architecture=gemma4)");
+            }
+            if (draft_arch != "gemma4-assistant") {
+                throw std::runtime_error(
+                        "external draft-mtp currently requires a Gemma 4 assistant GGUF "
+                        "(general.architecture=gemma4-assistant)");
+            }
+
+            result->shares_target_memory =
+                    llama_get_ctx_other(result->draft_context) == target_context;
+            if (!result->shares_target_memory) {
+                throw std::runtime_error(
+                        "Gemma 4 MTP assistant context did not attach to the target context");
+            }
+
+            const int32_t n_mtp_layers = llama_model_n_layer_nextn(draft_model);
+            if (n_mtp_layers <= 0) {
+                throw std::runtime_error(
+                        "Gemma 4 MTP assistant has no next-token prediction layers");
+            }
+
+            const int32_t target_width = llama_model_n_embd_out(target_model);
+            const int32_t draft_width  = llama_model_n_embd_out(draft_model);
+            if (target_width <= 0 || target_width != draft_width) {
+                throw std::runtime_error(
+                        "Gemma 4 target and MTP assistant hidden widths do not match (target=" +
+                        std::to_string(target_width) + ", assistant=" +
+                        std::to_string(draft_width) + ")");
+            }
+
+            std::string vocab_error;
+            if (!mtp_vocabs_are_compatible(target_model, draft_model, vocab_error)) {
+                throw std::runtime_error(
+                        "Gemma 4 target and MTP assistant are incompatible: " + vocab_error);
+            }
+
+            COM_INF(
+                    "native speculative bridge: Gemma 4 MTP assistant recognized "
+                    "(%d heads, shared target KV, n_max=%d)\n",
+                    n_mtp_layers,
+                    params->n_max);
         }
 
         draft.ctx_tgt = target_context;
@@ -251,6 +369,9 @@ bool llama_cpp_native_speculative_process(
         if (!common_speculative_process(speculative->speculative, *batch)) {
             return set_error(speculative, "llama.cpp common speculative batch processing failed");
         }
+        if (speculative->has_last_draft) {
+            speculative->last_draft_verified = true;
+        }
         speculative->last_error.clear();
         return true;
     } catch (const std::exception & exc) {
@@ -276,12 +397,18 @@ int32_t llama_cpp_native_speculative_draft(
         if (output_capacity == 0) {
             speculative->result.clear();
             speculative->has_last_draft = false;
+            speculative->last_draft_verified = false;
             speculative->last_error.clear();
             return 0;
+        }
+        if (speculative->has_last_draft) {
+            throw std::runtime_error(
+                    "cannot create a new native draft while the previous draft is outstanding");
         }
         assign_tokens(speculative->prompt, prompt_tokens, prompt_token_count);
         speculative->result.clear();
         speculative->has_last_draft = false;
+        speculative->last_draft_verified = false;
 
         auto & draft_params = common_speculative_get_draft_params(speculative->speculative, 0);
         draft_params = {
@@ -305,9 +432,10 @@ int32_t llama_cpp_native_speculative_draft(
             throw;
         }
 
-        // common_speculative_draft evaluates a temporary noise/proposal block
-        // in the draft context. The target verification batch will populate the
-        // accepted path again through process(), so discard the temporary block.
+        // Match llama.cpp server cleanup at checkpoint.pos_max + 1. Gemma 4's
+        // shared-cache seq_rm is intentionally a no-op, while independent draft
+        // contexts discard their temporary proposal block here. The target
+        // verification batch then repopulates the accepted path through process().
         if (!rollback_temporary_block()) {
             set_error(speculative, "failed to roll back temporary draft-context block");
             return -1;
@@ -316,6 +444,7 @@ int32_t llama_cpp_native_speculative_draft(
         const size_t count = std::min(output_capacity, speculative->result.size());
         std::copy_n(speculative->result.data(), count, output_tokens);
         speculative->has_last_draft = count > 0;
+        speculative->last_draft_verified = false;
         speculative->last_error.clear();
         return (int32_t) count;
     } catch (const std::exception & exc) {
@@ -339,8 +468,21 @@ bool llama_cpp_native_speculative_accept(
             if (n_accepted > speculative->result.size()) {
                 return set_error(speculative, "accepted draft count exceeds the last draft size");
             }
-            common_speculative_accept(speculative->speculative, 0, n_accepted);
+            if (speculative->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP &&
+                !speculative->last_draft_verified) {
+                if (n_accepted != 0) {
+                    return set_error(
+                            speculative,
+                            "cannot accept MTP tokens before target verification succeeds");
+                }
+                // Cancellation before verification must preserve the previous
+                // pending hidden row. MTP accept(0) would otherwise copy stale
+                // verification output into the next draft state.
+            } else {
+                common_speculative_accept(speculative->speculative, 0, n_accepted);
+            }
             speculative->has_last_draft = false;
+            speculative->last_draft_verified = false;
         }
         speculative->last_error.clear();
         return true;
@@ -396,11 +538,17 @@ bool llama_cpp_native_speculative_memory_clear(
     if (memory == nullptr) {
         return set_error(speculative, "draft context has no memory object");
     }
-    llama_memory_clear(memory, clear_data);
+    // Gemma 4 assistant contexts share the target cache's cell ledger. Python
+    // clears the target first; clearing this shared view again would also erase
+    // live target state if callers invoked draft.clear() independently.
+    if (!speculative->shares_target_memory) {
+        llama_memory_clear(memory, clear_data);
+    }
     llama_synchronize(speculative->draft_context);
     speculative->prompt.clear();
     speculative->result.clear();
     speculative->has_last_draft = false;
+    speculative->last_draft_verified = false;
     speculative->last_error.clear();
     return true;
 }

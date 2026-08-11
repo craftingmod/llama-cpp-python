@@ -326,6 +326,18 @@ class Llama:
                 raise ValueError(
                     "Experimental native speculative decoding only supports n_seq_max=1"
                 )
+            if (
+                native_context_reprefill
+                and not getattr(
+                    self._native_speculative,
+                    "supports_context_reprefill",
+                    True,
+                )
+            ):
+                raise ValueError(
+                    "draft-mtp does not support native_context_reprefill; "
+                    "increase n_ctx instead"
+                )
 
         configure_logging(
             verbose=verbose,
@@ -1182,6 +1194,11 @@ class Llama:
             or not self.native_context_reprefill
             or self.n_seq_max != 1
             or self._native_has_media_context
+            or not getattr(
+                self._native_speculative,
+                "supports_context_reprefill",
+                True,
+            )
         ):
             return False
         return tokens is None or all(
@@ -1264,7 +1281,14 @@ class Llama:
     ) -> None:
         """Clear and rebuild aligned target/draft text contexts at a safe point."""
         native_speculative = self._native_speculative
-        if native_speculative is None or not self.native_context_reprefill:
+        if native_speculative is None:
+            raise RuntimeError("Native speculative decoder is not configured")
+        if not getattr(native_speculative, "supports_context_reprefill", True):
+            raise RuntimeError(
+                "draft-mtp does not support context shifting or context "
+                "re-prefill; increase n_ctx"
+            )
+        if not self.native_context_reprefill:
             raise RuntimeError(
                 "Context shifting is not supported by experimental native "
                 "speculative decoding; enable native_context_reprefill or increase n_ctx"
@@ -1978,6 +2002,34 @@ class Llama:
                     "Custom logits_processor callbacks are not supported by "
                     "experimental native speculative decoding"
                 )
+            if (
+                not getattr(native_speculative, "supports_multimodal", True)
+                and (
+                    self._native_has_media_context
+                    or any(token < 0 for token in original_tokens)
+                )
+            ):
+                raise ValueError(
+                    "draft-mtp currently supports text-only generation; "
+                    "multimodal media context is not supported"
+                )
+
+        if (
+            reset
+            and self.n_tokens > 0
+            and native_speculative is not None
+            and not getattr(native_speculative, "supports_prefix_reuse", True)
+        ):
+            if self.verbose:
+                print(
+                    "Llama.generate: native draft type does not support prefix "
+                    "reuse; clearing target and draft state.",
+                    file=sys.stderr,
+                )
+            self.reset()
+            # The contexts are already empty; evaluate the complete prompt below
+            # without entering the normal prefix-match/reset block a second time.
+            reset = False
 
         # Check for kv cache prefix match
         if reset and self.n_tokens > 0:

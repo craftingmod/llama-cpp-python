@@ -1959,12 +1959,64 @@ finally:
     llm.close()
 ```
 
+Gemma 4 can use a matching external `gemma4-assistant` GGUF through the same
+bridge. This first MTP path is text-only:
+
+```python
+from llama_cpp import Llama
+from llama_cpp.llama_speculative import LlamaNativeSpeculativeDecoding
+
+draft = LlamaNativeSpeculativeDecoding(
+    model_path="models/mtp-gemma-4-12B-it.gguf",
+    spec_type="draft-mtp",
+    n_gpu_layers="all",
+    n_max=2,
+)
+
+llm = Llama(
+    model_path="models/gemma-4-12B-it-Q4_K_M.gguf",
+    draft_model=draft,
+    n_gpu_layers="all",
+    n_ctx=4096,
+)
+
+try:
+    response = llm.create_chat_completion(
+        messages=[{"role": "user", "content": "Explain MTP briefly."}],
+        max_tokens=128,
+        temperature=0.0,
+    )
+    print(response["choices"][0]["message"]["content"])
+    print(draft.stats)
+finally:
+    llm.close()
+```
+
+`draft-mtp` defaults to `n_max=2`. The
+[Unsloth MTP guide](https://unsloth.ai/docs/models/mtp) recommends starting at
+2 and benchmarking values from 1 through 6; it also notes that MTP typically
+needs about 2 GB of additional RAM or VRAM. Keep the default F16 draft KV types
+for the initial compatibility test. The target and assistant must be the same
+Gemma 4 variant and tokenizer. Initialization verifies their architectures,
+hidden width, and vocabulary before enabling the shared-KV path.
+
+This prototype requires an external assistant path; target-embedded MTP is not
+yet exposed by this API. `Llama(load_mtp=True)` controls MTP tensors embedded in
+the target GGUF and is therefore not required for this external Gemma 4
+assistant configuration. MTP currently rejects image/audio batches and
+`native_context_reprefill=True`; use one text sequence and choose `n_ctx` large
+enough for the complete request. To avoid reusing stale shared assistant state,
+each subsequent MTP request clears both contexts and evaluates its full prompt
+again. The repeat-request smoke utility is
+`examples/high_level_api/native_speculative_mtp.py`.
+
 This native path is intentionally experimental. Its Python and C ABI may change,
 and it currently supports one sequence at a time. The target GGUF, draft GGUF,
 and optional `mmproj` must be compatible companion artifacts. Native speculative
-image input is supported through `GenericMTMDChatHandler`: every successful target
-embedding decode batch is immediately mirrored into the draft context before the
-next target decode. Audio and video are not yet supported by this native path.
+image input is supported for DFlash/DSpark through `GenericMTMDChatHandler`:
+every successful target embedding decode batch is immediately mirrored into the
+draft context before the next target decode. MTP, audio, and video are not yet
+supported by this multimodal path.
 
 For long, text-only completions, `native_context_reprefill=True` enables an opt-in
 correctness fallback when the native target and draft contexts fill:
@@ -2003,9 +2055,8 @@ draft context, and custom Python `logits_processor` callbacks remain unsupported
 contained image placeholders; it does not replay or re-encode source media.
 A wheel built with this experimental `llama-common` bridge is required; older wheels do
 not provide the needed native symbols. `draft-dspark` uses the same API when a
-compatible DSpark GGUF pair is available. The end-to-end comparison utility at
-`scripts/native_speculative_vision_hello.py` runs target-only first, releases it,
-then runs native speculative image generation and prints draft/accept statistics.
+compatible DSpark GGUF pair is available. Gemma 4 MTP does not use this context
+re-prefill fallback.
 
 ---
 

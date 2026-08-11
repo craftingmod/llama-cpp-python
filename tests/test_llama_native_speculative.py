@@ -36,7 +36,10 @@ class _FakeNativeParams(ctypes.Structure):
 
 
 class _FakeBatch(ctypes.Structure):
-    _fields_ = [("n_tokens", ctypes.c_int32)]
+    _fields_ = [
+        ("n_tokens", ctypes.c_int32),
+        ("embd", ctypes.POINTER(ctypes.c_float)),
+    ]
 
 
 class _FakeModel:
@@ -204,6 +207,25 @@ def test_native_speculative_configuration_is_lazy(fake_native):
     assert load_calls == []
 
 
+def test_native_mtp_configuration_uses_conservative_defaults(fake_native):
+    _native, load_calls = fake_native
+
+    draft = LlamaNativeSpeculativeDecoding(
+        "mtp.gguf",
+        spec_type="DRAFT-MTP",
+    )
+
+    assert draft.spec_type == "draft-mtp"
+    assert draft.max_draft_tokens == 2
+    assert draft.is_mtp is True
+    assert draft.supports_multimodal is False
+    assert draft.supports_context_reprefill is False
+    assert draft.supports_prefix_reuse is False
+    assert load_calls == []
+
+    draft.close()
+
+
 @pytest.mark.parametrize(
     ("kwargs", "message"),
     [
@@ -245,6 +267,63 @@ def test_native_speculative_maps_gpu_layer_setting(
     assert native.init_params["spec_type"] == b"draft-dflash"
     assert native.init_params["n_gpu_layers"] == expected
     assert native.init_params["n_max"] == 15
+    draft.close()
+
+
+def test_native_mtp_uses_existing_external_draft_abi(fake_native):
+    native, _load_calls = fake_native
+    draft = LlamaNativeSpeculativeDecoding(
+        "mtp.gguf",
+        spec_type="draft-mtp",
+    )
+
+    draft._bind(_FakeModel(), _FakeContext())
+
+    assert native.init_params is not None
+    assert native.init_params["model_path"] == b"mtp.gguf"
+    assert native.init_params["spec_type"] == b"draft-mtp"
+    assert native.init_params["n_max"] == 2
+    draft.close()
+
+
+def test_native_mtp_rejects_embedding_batch_before_bridge_call(fake_native):
+    native, _load_calls = fake_native
+    draft = LlamaNativeSpeculativeDecoding(
+        "mtp.gguf",
+        spec_type="draft-mtp",
+    )
+    draft._bind(_FakeModel(), _FakeContext())
+
+    # ctypes exposes a typed null pointer object for a null C field. It must
+    # remain a normal text batch instead of being mistaken for embeddings.
+    draft._process_batch(_FakeBatch(n_tokens=1))
+
+    with pytest.raises(ValueError, match="text token batches only"):
+        draft._process_batch(SimpleNamespace(embd=object()))
+
+    assert sum(call[0] == "process" for call in native.calls) == 1
+    draft.close()
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "message"),
+    [
+        ({"n_seq_max": 2}, "n_seq_max=1"),
+        (
+            {"native_context_reprefill": True},
+            "does not support native_context_reprefill",
+        ),
+    ],
+)
+def test_native_mtp_rejects_unsupported_llama_modes(kwargs, message):
+    draft = LlamaNativeSpeculativeDecoding(
+        "mtp.gguf",
+        spec_type="draft-mtp",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        Llama("target.gguf", draft_model=draft, **kwargs)
+
     draft.close()
 
 
@@ -468,6 +547,7 @@ class _GenerationContext:
 
 class _GenerationNative:
     max_draft_tokens = 2
+    supports_prefix_reuse = True
 
     def __init__(self):
         self.begins = []
@@ -629,6 +709,67 @@ def test_native_generation_full_match_never_evaluates_media_placeholders(
 
     assert native.begins == [[10, -123, 20]]
     assert eval_calls == [[21, 30, 40]]
+    generation.close()
+
+
+def test_native_mtp_repeated_request_clears_state_instead_of_reusing_prefix(
+    monkeypatch,
+):
+    native = _GenerationNative()
+    native.supports_prefix_reuse = False
+    context = _GenerationContext()
+    eval_calls = []
+
+    llm = object.__new__(Llama)
+    llm._native_speculative = native
+    llm.draft_model = native
+    llm._ctx = context
+    llm._model = object()
+    llm._hybrid_cache_mgr = None
+    llm.is_hybrid = False
+    llm.verbose = False
+    llm.n_tokens = 3
+    llm._n_ctx = 32
+    llm._n_vocab = 256
+    llm.input_ids = np.empty(32, dtype=np.intc)
+    llm.input_ids[:3] = [10, 11, 12]
+    llm.scores = np.empty((1, 256), dtype=np.single)
+    llm._logits_all = False
+    llm._sampling_ctx = None
+    llm._seed = 123
+    llm._abort_event = threading.Event()
+    llm._native_has_media_context = False
+    llm.longest_token_prefix = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("MTP must not attempt prefix reuse")
+    )
+
+    def fake_eval(
+        self,
+        tokens,
+        active_loras=None,
+        control_vector=None,
+        copy_logits=True,
+        output_all=False,
+        require_atomic=False,
+    ):
+        del active_loras, control_vector, copy_logits, output_all, require_atomic
+        tokens = list(tokens)
+        eval_calls.append(tokens)
+        start = self.n_tokens
+        self.input_ids[start : start + len(tokens)] = tokens
+        self.n_tokens += len(tokens)
+
+    llm.eval = MethodType(fake_eval, llm)
+    _GenerationSampler.outputs = [20]
+    _GenerationSampler.indices = []
+    monkeypatch.setattr(llama_module, "LlamaSamplingContext", _GenerationSampler)
+
+    generation = llm.generate([10, 11, 12], reset=True, temp=0.0)
+    assert next(generation) == 20
+
+    assert context.clear_count == 1
+    assert native.clear_count == 1
+    assert eval_calls == [[10, 11, 12]]
     generation.close()
 
 

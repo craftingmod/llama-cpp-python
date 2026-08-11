@@ -266,6 +266,20 @@ def test_native_multimodal_prefill_processes_each_decode_batch_once(monkeypatch)
     ]
 
 
+def test_native_mtp_rejects_media_without_clearing_text_state(monkeypatch):
+    handler, llama, native, events = _make_handler(monkeypatch)
+    native.supports_multimodal = False
+
+    with pytest.raises(ValueError, match="draft-mtp.*text-only"):
+        handler(llama=llama, messages=[])
+
+    assert llama.n_tokens == 3
+    assert llama._ctx.clear_count == 0
+    assert native.clear_count == 0
+    assert not any(event[0] == "target_decode" for event in events)
+    assert sum(event[0] == "chunks_free" for event in events) == 1
+
+
 @pytest.mark.parametrize(
     ("failure", "message"),
     [

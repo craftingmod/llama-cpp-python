@@ -21,19 +21,27 @@ class LlamaNativeSpeculativeDecoding(LlamaDraftModel):
     """Experimental llama.cpp/common GGUF draft-model integration.
 
     The draft model is loaded lazily when this object is attached to ``Llama``.
-    This first implementation intentionally supports one text sequence and the
-    DFlash/DSpark block-diffusion implementations only.
+    This implementation intentionally supports one sequence. DFlash and DSpark
+    can also mirror supported image batches; external Gemma 4 MTP assistants are
+    currently text-only.
     """
 
     is_native = True
-    _SUPPORTED_TYPES = {"draft-dflash", "draft-dspark"}
+    _SUPPORTED_TYPES = {"draft-dflash", "draft-dspark", "draft-mtp"}
+    _DEFAULT_N_MAX = {
+        "draft-dflash": 15,
+        "draft-dspark": 15,
+        "draft-mtp": 2,
+    }
 
     def __init__(
         self,
         model_path: str,
         *,
-        spec_type: Literal["draft-dflash", "draft-dspark"] = "draft-dflash",
-        n_max: int = 15,
+        spec_type: Literal[
+            "draft-dflash", "draft-dspark", "draft-mtp"
+        ] = "draft-dflash",
+        n_max: Optional[int] = None,
         n_min: int = 0,
         p_min: float = 0.0,
         n_gpu_layers: Union[int, Literal["auto", "all"]] = "auto",
@@ -54,9 +62,11 @@ class LlamaNativeSpeculativeDecoding(LlamaDraftModel):
         normalized_type = spec_type.strip().lower()
         if normalized_type not in self._SUPPORTED_TYPES:
             raise ValueError(
-                "spec_type must be 'draft-dflash' or 'draft-dspark' in this "
-                "experimental implementation"
+                "spec_type must be 'draft-dflash', 'draft-dspark', or "
+                "'draft-mtp' in this experimental implementation"
             )
+        if n_max is None:
+            n_max = self._DEFAULT_N_MAX[normalized_type]
         if n_max <= 0:
             raise ValueError("n_max must be greater than zero")
         if n_min < 0 or n_min > n_max:
@@ -101,6 +111,26 @@ class LlamaNativeSpeculativeDecoding(LlamaDraftModel):
     @property
     def max_draft_tokens(self) -> int:
         return self.n_max
+
+    @property
+    def is_mtp(self) -> bool:
+        """Whether this decoder uses llama.cpp's MTP implementation."""
+        return self.spec_type == "draft-mtp"
+
+    @property
+    def supports_multimodal(self) -> bool:
+        """Whether target embedding batches can be mirrored into the draft."""
+        return not self.is_mtp
+
+    @property
+    def supports_context_reprefill(self) -> bool:
+        """Whether clear-and-replay context fallback is enabled for this type."""
+        return not self.is_mtp
+
+    @property
+    def supports_prefix_reuse(self) -> bool:
+        """Whether an existing target/draft prefix can be reused safely."""
+        return not self.is_mtp
 
     @property
     def stats(self) -> Dict[str, Union[int, float]]:
@@ -241,6 +271,11 @@ class LlamaNativeSpeculativeDecoding(LlamaDraftModel):
 
     def _process_batch(self, batch: Any) -> None:
         native, handle = self._require_handle()
+        if self.is_mtp and bool(getattr(batch, "embd", None)):
+            raise ValueError(
+                "draft-mtp currently supports text token batches only; "
+                "multimodal embedding batches are not supported"
+            )
         if not native.llama_cpp_native_speculative_process(
             handle, ctypes.byref(batch)
         ):
