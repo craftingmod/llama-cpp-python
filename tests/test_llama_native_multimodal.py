@@ -242,6 +242,7 @@ def test_native_multimodal_prefill_processes_each_decode_batch_once(monkeypatch)
         20,
     ]
     assert llama.n_tokens == 8
+    assert llama._native_has_media_context is True
 
     ordered_names = [event[0] for event in events]
     assert ordered_names == [

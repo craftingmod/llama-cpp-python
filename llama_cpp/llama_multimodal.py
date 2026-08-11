@@ -1085,6 +1085,10 @@ class MTMDChatHandler:
                 # rollback, context shifting, or hybrid checkpoints. Start every
                 # request containing media from two empty, position-aligned contexts.
                 self._reset_native_multimodal_contexts(llama)
+                # Keep an explicit generation-level marker in addition to the
+                # negative virtual ledger ids. A future trimmed ledger must never
+                # make media context appear safe for token-only replay.
+                llama._native_has_media_context = True
                 if len(full_prompt_ids) > llama.n_ctx():
                     raise RuntimeError(
                         "Experimental native speculative multimodal prefill does "
@@ -1407,6 +1411,7 @@ class MTMDChatHandler:
 
         # Never leave the Python ledger pointing at state that has been cleared.
         llama.n_tokens = 0
+        llama._native_has_media_context = False
         if first_error is not None:
             raise RuntimeError(
                 "Failed to clear target and native draft contexts before "

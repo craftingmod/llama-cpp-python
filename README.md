@@ -1966,11 +1966,41 @@ image input is supported through `GenericMTMDChatHandler`: every successful targ
 embedding decode batch is immediately mirrored into the draft context before the
 next target decode. Audio and video are not yet supported by this native path.
 
+For long, text-only completions, `native_context_reprefill=True` enables an opt-in
+correctness fallback when the native target and draft contexts fill:
+
+```python
+llm = Llama(
+    model_path="models/muse-glimmer-30B-kquant-17gb.gguf",
+    draft_model=draft,
+    n_ctx=1024,
+    n_keep=128,
+    native_context_reprefill=True,
+)
+
+response = llm(
+    "Write a long numbered table.",
+    max_tokens=2000,  # explicit positive limits are not clamped to initial free space
+    temperature=0.0,
+)
+print(llm.native_context_reprefill_stats)
+```
+
+The fallback clears both contexts, keeps the initial `n_keep` prefix and a recent
+token window, then replays those token IDs into target and draft state. This is not
+KV shifting: positions restart at zero, and joining the retained prefix to the
+recent window loses the discarded semantic context. Sampler penalty history is not
+reset, while Python stopping criteria observe the retained context ledger after a
+re-prefill. Only explicit positive `max_tokens` values may cross the initial context
+boundary; `None` and non-positive values retain their existing finite meaning.
+
 Each native multimodal request performs a full target-and-draft re-prefill. Media
 prefix reuse, media rollback, multimodal context shifting, and multimodal Python
 state save/load are intentionally disabled; increase `n_ctx` if the complete
 prompt does not fit. Python-side `Llama` state caches still do not include the
 draft context, and custom Python `logits_processor` callbacks remain unsupported.
+`native_context_reprefill` is text-only and deliberately rejects a context that has
+contained image placeholders; it does not replay or re-encode source media.
 A wheel built with this experimental `llama-common` bridge is required; older wheels do
 not provide the needed native symbols. `draft-dspark` uses the same API when a
 compatible DSpark GGUF pair is available. The end-to-end comparison utility at

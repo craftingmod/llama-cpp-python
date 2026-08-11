@@ -165,6 +165,7 @@ class Llama:
         chat_handler: Optional[llama_chat_format.LlamaChatCompletionHandler] = None,
         # Speculative Decoding
         draft_model: Optional[LlamaDraftModel] = None,
+        native_context_reprefill: bool = False,
         # Tokenizer Override
         tokenizer: Optional[BaseLlamaTokenizer] = None,
         # KV cache quantization
@@ -267,6 +268,10 @@ class Llama:
             chat_format: String specifying the chat format to use when calling create_chat_completion.
             chat_handler: Optional chat handler to use when calling create_chat_completion.
             draft_model: Optional draft model to use for speculative decoding.
+            native_context_reprefill: Opt in to a correctness-oriented text-only
+                fallback for native speculative decoding. When the context fills,
+                clear target and draft state together, retain the initial ``n_keep``
+                prefix plus a recent token window, and prefill both contexts again.
             tokenizer: Optional tokenizer to override the default tokenizer from llama.cpp.
             type_k: KV cache data type for K (default: f16)
             type_v: KV cache data type for V (default: f16)
@@ -305,6 +310,16 @@ class Llama:
         self._native_speculative = (
             draft_model if getattr(draft_model, "is_native", False) else None
         )
+        self.native_context_reprefill = bool(native_context_reprefill)
+        self._native_context_reprefill_in_progress = False
+        self._native_context_reprefill_epoch = 0
+        self._native_has_media_context = False
+        self._native_context_reprefill_stats = {
+            "context_reprefill_count": 0,
+            "context_reprefill_tokens": 0,
+            "context_discarded_tokens": 0,
+            "context_reprefill_failures": 0,
+        }
 
         if self._native_speculative is not None:
             if n_seq_max != 1:
@@ -1150,7 +1165,192 @@ class Llama:
         if self._native_speculative is not None:
             self._ctx.memory_clear(True)
             self._native_speculative.clear()
+            self._native_has_media_context = False
         self.n_tokens = 0
+
+    @property
+    def native_context_reprefill_stats(self) -> Dict[str, int]:
+        """Return Python orchestration statistics for native context re-prefills."""
+        return dict(self._native_context_reprefill_stats)
+
+    def _native_text_context_reprefill_enabled(
+        self, tokens: Optional[Sequence[int]] = None
+    ) -> bool:
+        """Return whether the opt-in native text fallback is usable right now."""
+        if (
+            self._native_speculative is None
+            or not self.native_context_reprefill
+            or self.n_seq_max != 1
+            or self._native_has_media_context
+        ):
+            return False
+        return tokens is None or all(
+            isinstance(token, int) and token >= 0 for token in tokens
+        )
+
+    def _resolve_completion_max_tokens(
+        self,
+        prompt_tokens: Sequence[int],
+        max_tokens: Optional[int],
+    ) -> int:
+        """Resolve completion length while preserving the opt-in's finite request."""
+        remaining_context = self._n_ctx - len(prompt_tokens)
+        if max_tokens is None or max_tokens <= 0:
+            return remaining_context
+        if self._native_text_context_reprefill_enabled(prompt_tokens):
+            return max_tokens
+        return min(max_tokens, remaining_context)
+
+    def _native_speculative_retained_tokens(
+        self,
+        history: Sequence[int],
+        *,
+        incoming_tokens: int,
+    ) -> tuple[List[int], int]:
+        """Select the initial prefix and newest text tokens for a fresh context."""
+        native_speculative = self._native_speculative
+        if native_speculative is None:
+            raise RuntimeError("Native speculative decoder is not configured")
+        if incoming_tokens <= 0:
+            raise RuntimeError("Native context re-prefill requires incoming tokens")
+
+        # Besides the incoming eval and one complete native draft block, keep one
+        # slot for the next sampled token so drafting can actually resume.
+        hard_min = incoming_tokens + int(native_speculative.max_draft_tokens) + 1
+        if self._n_ctx <= hard_min:
+            raise RuntimeError(
+                "Native context re-prefill cannot make progress: "
+                f"n_ctx={self._n_ctx} must exceed incoming_tokens({incoming_tokens}) "
+                f"+ max_draft_tokens({native_speculative.max_draft_tokens}) + 1"
+            )
+
+        reserve = min(self._n_ctx, max(hard_min, self._n_ctx // 4))
+        retained_capacity = self._n_ctx - reserve
+        if retained_capacity < 1:
+            raise RuntimeError(
+                "Native context re-prefill cannot retain a recent text token"
+            )
+
+        effective_keep = min(
+            self.n_keep,
+            len(history),
+            max(0, retained_capacity - 1),
+        )
+        recent_capacity = retained_capacity - effective_keep
+        recent_start = max(effective_keep, len(history) - recent_capacity)
+        retained = list(history[:effective_keep]) + list(history[recent_start:])
+
+        if not retained:
+            raise RuntimeError(
+                "Native context re-prefill cannot retain a recent text token"
+            )
+        if len(retained) >= len(history):
+            raise RuntimeError(
+                "Native context re-prefill cannot make progress because no old "
+                "tokens can be discarded"
+            )
+        if len(retained) + incoming_tokens > self._n_ctx:
+            raise RuntimeError(
+                "Native context re-prefill retained too many tokens for the incoming batch"
+            )
+        return retained, reserve
+
+    def _native_speculative_reprefill_context(
+        self,
+        *,
+        incoming_tokens: int,
+        active_loras: Optional[List[Dict[str, Union[str, float]]]] = None,
+        control_vector: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Clear and rebuild aligned target/draft text contexts at a safe point."""
+        native_speculative = self._native_speculative
+        if native_speculative is None or not self.native_context_reprefill:
+            raise RuntimeError(
+                "Context shifting is not supported by experimental native "
+                "speculative decoding; enable native_context_reprefill or increase n_ctx"
+            )
+        if self.n_seq_max != 1:
+            raise RuntimeError("Native context re-prefill only supports n_seq_max=1")
+        if self._native_context_reprefill_in_progress:
+            raise RuntimeError("Native context re-prefill re-entered unexpectedly")
+
+        history = self.input_ids[: self.n_tokens].astype(int).tolist()
+        if self._native_has_media_context or any(token < 0 for token in history):
+            raise RuntimeError(
+                "Native context clear-and-reprefill is text-only; multimodal "
+                "media context cannot be replayed"
+            )
+        self._validate_eval_tokens(history)
+        retained, reserve = self._native_speculative_retained_tokens(
+            history,
+            incoming_tokens=incoming_tokens,
+        )
+        discarded = len(history) - len(retained)
+
+        try:
+            self._ctx.memory_clear(True)
+            native_speculative.clear()
+            self.n_tokens = 0
+            self._native_has_media_context = False
+
+            self._native_context_reprefill_in_progress = True
+            try:
+                self.eval(
+                    retained,
+                    active_loras=active_loras,
+                    control_vector=control_vector,
+                    copy_logits=False,
+                )
+            finally:
+                self._native_context_reprefill_in_progress = False
+
+            if self.n_tokens != len(retained):
+                raise RuntimeError(
+                    "Native context re-prefill position mismatch: "
+                    f"expected {len(retained)}, got {self.n_tokens}"
+                )
+            native_speculative._begin(self.input_ids[: self.n_tokens])
+        except BaseException as exc:
+            self._native_context_reprefill_in_progress = False
+            cleanup_errors = []
+            for name, clear in (
+                ("target", lambda: self._ctx.memory_clear(True)),
+                ("draft", native_speculative.clear),
+            ):
+                try:
+                    clear()
+                except BaseException as cleanup_exc:
+                    cleanup_errors.append(f"{name}: {cleanup_exc}")
+            self.n_tokens = 0
+            self._native_has_media_context = False
+            self._native_context_reprefill_stats[
+                "context_reprefill_failures"
+            ] += 1
+            message = "Native text context clear-and-reprefill failed"
+            if cleanup_errors:
+                message += "; cleanup also failed (" + ", ".join(cleanup_errors) + ")"
+            raise RuntimeError(message) from exc
+
+        self._native_context_reprefill_epoch += 1
+        self._native_context_reprefill_stats["context_reprefill_count"] += 1
+        self._native_context_reprefill_stats[
+            "context_reprefill_tokens"
+        ] += len(retained)
+        self._native_context_reprefill_stats[
+            "context_discarded_tokens"
+        ] += discarded
+        if self.verbose:
+            prefix_count = min(
+                self.n_keep,
+                len(history),
+                max(0, self._n_ctx - reserve - 1),
+            )
+            print(
+                "Llama.generate: native text context exhausted; "
+                f"keeping {prefix_count} prefix tokens, discarding {discarded} "
+                f"tokens, replaying {len(retained)} tokens, reserving {reserve} slots",
+                file=sys.stderr,
+            )
 
     def _native_speculative_truncate(self, position: int) -> None:
         """Truncate target and native draft state at the same token position."""
@@ -1247,61 +1447,72 @@ class Llama:
         # Context Shift: Prevent OOM by discarding older tokens when context limit is reached.
         if self.n_tokens + n_eval > self._n_ctx:
             if self._native_speculative is not None:
-                raise RuntimeError(
-                    "Context shifting is not supported by experimental native "
-                    "speculative decoding; increase n_ctx or start a fresh generation"
+                if require_atomic:
+                    raise RuntimeError(
+                        "Native context re-prefill cannot run during an in-flight "
+                        "speculative verification block"
+                    )
+                if self._native_context_reprefill_in_progress:
+                    raise RuntimeError(
+                        "Native context re-prefill retained too many tokens"
+                    )
+                self._native_speculative_reprefill_context(
+                    incoming_tokens=n_eval,
+                    active_loras=active_loras,
+                    control_vector=control_vector,
                 )
-            # 0. Check if the memory supports shifting
-            if not self._ctx.memory_can_shift():
-                raise RuntimeError(
-                    f"Llama.eval: Context Shift is explicitly disabled by the C++ backend "
-                    f"(n_pos_per_embd > 1 or incompatible M-RoPE). "
-                    f"You MUST increase n_ctx (currently {self._n_ctx}) to fit the dialogue."
-                )
-            # 1. Calculate the absolute minimum number of tokens we must discard to fit the new chunk.
-            required_discard = (self.n_tokens + n_eval) - self._n_ctx
+            else:
+                # 0. Check if the memory supports shifting
+                if not self._ctx.memory_can_shift():
+                    raise RuntimeError(
+                        f"Llama.eval: Context Shift is explicitly disabled by the C++ backend "
+                        f"(n_pos_per_embd > 1 or incompatible M-RoPE). "
+                        f"You MUST increase n_ctx (currently {self._n_ctx}) to fit the dialogue."
+                    )
+                # 1. Calculate the absolute minimum number of tokens we must discard to fit the new chunk.
+                required_discard = (self.n_tokens + n_eval) - self._n_ctx
 
-            # 2. Sanity check: If the incoming chunk itself is larger than the entire context window,
-            # shifting is physically impossible.
-            if required_discard > self.n_tokens:
-                raise RuntimeError(f"Llama.eval: Context shift failed. The incoming chunk ({n_eval} tokens) "
-                                   f"is larger than the entire context window ({self._n_ctx}).")
+                # 2. Sanity check: If the incoming chunk itself is larger than the entire context window,
+                # shifting is physically impossible.
+                if required_discard > self.n_tokens:
+                    raise RuntimeError(f"Llama.eval: Context shift failed. The incoming chunk ({n_eval} tokens) "
+                                       f"is larger than the entire context window ({self._n_ctx}).")
 
-            # 3. Determine how many tokens to keep at the beginning (usually the System Prompt).
-            _n_keep_desired = min(self.n_keep, self.n_tokens)
+                # 3. Determine how many tokens to keep at the beginning (usually the System Prompt).
+                _n_keep_desired = min(self.n_keep, self.n_tokens)
 
-            # Ensure that keeping these tokens doesn't prevent us from discarding the required amount.
-            max_keep_allowed = max(0, self.n_tokens - required_discard)
-            _n_keep = min(_n_keep_desired, max_keep_allowed)
+                # Ensure that keeping these tokens doesn't prevent us from discarding the required amount.
+                max_keep_allowed = max(0, self.n_tokens - required_discard)
+                _n_keep = min(_n_keep_desired, max_keep_allowed)
 
-            # 4. Calculate the final discard count. Default strategy is to discard half of the available
-            # past tokens to minimize frequent shifting, but it must be at least `required_discard`.
-            _n_discard = max(required_discard, (self.n_tokens - _n_keep) // 2)
+                # 4. Calculate the final discard count. Default strategy is to discard half of the available
+                # past tokens to minimize frequent shifting, but it must be at least `required_discard`.
+                _n_discard = max(required_discard, (self.n_tokens - _n_keep) // 2)
 
-            # 5. Execute the shift only if there are tokens to discard.
-            if _n_discard > 0:
-                if self.verbose:
-                    model_type = "Hybrid/Recurrent/SWA" if getattr(self, 'is_hybrid', False) else "Transformer"
-                    print(f"Llama.eval: {model_type} context limit reached. Shifting context: "
-                          f"keeping {_n_keep}, discarding {_n_discard} tokens...", file=sys.stderr)
+                # 5. Execute the shift only if there are tokens to discard.
+                if _n_discard > 0:
+                    if self.verbose:
+                        model_type = "Hybrid/Recurrent/SWA" if getattr(self, 'is_hybrid', False) else "Transformer"
+                        print(f"Llama.eval: {model_type} context limit reached. Shifting context: "
+                              f"keeping {_n_keep}, discarding {_n_discard} tokens...", file=sys.stderr)
 
-                try:
-                    # Remove the specified block of tokens from the physical KV cache
-                    self._ctx.memory_seq_rm(0, _n_keep, _n_keep + _n_discard)
+                    try:
+                        # Remove the specified block of tokens from the physical KV cache
+                        self._ctx.memory_seq_rm(0, _n_keep, _n_keep + _n_discard)
 
-                    # Shift the positional IDs of all subsequent tokens to the left to close the gap
-                    self._ctx.memory_seq_add(0, _n_keep + _n_discard, self.n_tokens, -_n_discard)
-                except Exception as e:
-                    # Defense-in-depth: Catch any other recoverable backend errors
-                    raise RuntimeError(f"Llama.eval: Context Shift failed at the C++ level. Error: {str(e)}") from e
+                        # Shift the positional IDs of all subsequent tokens to the left to close the gap
+                        self._ctx.memory_seq_add(0, _n_keep + _n_discard, self.n_tokens, -_n_discard)
+                    except Exception as e:
+                        # Defense-in-depth: Catch any other recoverable backend errors
+                        raise RuntimeError(f"Llama.eval: Context Shift failed at the C++ level. Error: {str(e)}") from e
 
-                # 6. Synchronize the Python-side token tracking array (ledger)
-                remaining_len = self.n_tokens - (_n_keep + _n_discard)
-                if remaining_len > 0:
-                    self.input_ids[_n_keep : _n_keep + remaining_len] = self.input_ids[_n_keep + _n_discard : self.n_tokens]
+                    # 6. Synchronize the Python-side token tracking array (ledger)
+                    remaining_len = self.n_tokens - (_n_keep + _n_discard)
+                    if remaining_len > 0:
+                        self.input_ids[_n_keep : _n_keep + remaining_len] = self.input_ids[_n_keep + _n_discard : self.n_tokens]
 
-                # 7. Update the global token counter
-                self.n_tokens -= _n_discard
+                    # 7. Update the global token counter
+                    self.n_tokens -= _n_discard
 
         # Adaptive batch downgrade limit initialization
         current_max_batch = n_eval if require_atomic else self.n_batch
@@ -1837,6 +2048,7 @@ class Llama:
                                 # rollback window. Re-prefill both contexts instead.
                                 self._ctx.memory_clear(True)
                                 native_speculative.clear()
+                                self._native_has_media_context = False
                                 self.n_tokens = 0
                                 tokens = original_tokens
                         elif self.is_hybrid and self._hybrid_cache_mgr is not None:
@@ -1881,6 +2093,7 @@ class Llama:
             self._ctx.memory_clear(True)
             if native_speculative is not None:
                 native_speculative.clear()
+                self._native_has_media_context = False
             if self.is_hybrid and self._hybrid_cache_mgr is not None:
                 self._hybrid_cache_mgr.clear()
             if self.verbose:
@@ -1988,6 +2201,7 @@ class Llama:
         native_draft_len = 0
         native_draft_start = 0
         native_block_decoded = False
+        native_reprefill_epoch = getattr(self, "_native_context_reprefill_epoch", 0)
 
         # Main evaluation and generation loop
         try:
@@ -2034,6 +2248,7 @@ class Llama:
                             native_speculative is not None and native_draft_len > 0
                         )
                         verification_base = self.n_tokens
+                        eval_base = self.n_tokens
                         try:
                             self.eval(
                                 tokens,
@@ -2043,6 +2258,17 @@ class Llama:
                                 output_all=native_verification,
                                 require_atomic=native_verification,
                             )
+                            current_reprefill_epoch = getattr(
+                                self, "_native_context_reprefill_epoch", 0
+                            )
+                            if current_reprefill_epoch != native_reprefill_epoch:
+                                # Re-prefill rebuilds positions from zero. Preserve
+                                # sample_idx's offset into this pending eval batch.
+                                sample_idx += self.n_tokens - len(tokens) - eval_base
+                                native_reprefill_epoch = current_reprefill_epoch
+                                # The helper already began the native decoder using
+                                # the newly retained context.
+                                native_begun = True
                             if native_verification:
                                 native_block_decoded = True
                         except BaseException:
@@ -2677,16 +2903,7 @@ class Llama:
                 f"Requested tokens ({len(prompt_tokens)}) exceed context window of {llama_cpp_lib.llama_n_ctx(self.ctx)}"
             )
 
-        if max_tokens is None or max_tokens <= 0:
-            # Unlimited, depending on n_ctx.
-            max_tokens = self._n_ctx - len(prompt_tokens)
-
-        # Truncate max_tokens if requested tokens would exceed the context window
-        max_tokens = (
-            max_tokens
-            if max_tokens + len(prompt_tokens) < self._n_ctx
-            else (self._n_ctx - len(prompt_tokens))
-        )
+        max_tokens = self._resolve_completion_max_tokens(prompt_tokens, max_tokens)
 
         if stop != []:
             stop_sequences = [s.encode("utf-8") for s in stop]

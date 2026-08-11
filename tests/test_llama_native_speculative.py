@@ -693,3 +693,249 @@ def test_native_generation_supports_token_stopping_criteria(monkeypatch):
     assert native.accepted == [1]
     assert context.removals == [(0, 3, -1)]
     assert native.removals == [(3, -1)]
+
+
+class _ReprefillContext(_EvalContext):
+    def __init__(self, events, *, fail_clear_once=False, fail_decode_once=False):
+        super().__init__(events, [])
+        self.fail_clear_once = fail_clear_once
+        self.fail_decode_once = fail_decode_once
+
+    def memory_clear(self, clear_data):
+        self.events.append(("target_clear", bool(clear_data)))
+        if self.fail_clear_once:
+            self.fail_clear_once = False
+            raise RuntimeError("injected target clear failure")
+
+    def decode(self, batch):
+        self.events.append(("decode", batch.batch.n_tokens))
+        if self.fail_decode_once:
+            self.fail_decode_once = False
+            raise RuntimeError("injected target decode failure")
+        return 0
+
+    def memory_seq_rm(self, seq_id, p0, p1):
+        self.events.append(("target_rm", seq_id, p0, p1))
+        return True
+
+
+class _ReprefillNative(_ProcessRecorder):
+    max_draft_tokens = 2
+
+    def __init__(
+        self,
+        events,
+        *,
+        fail_clear_once=False,
+        fail_process_once=False,
+        fail_begin=False,
+    ):
+        super().__init__(events)
+        self.fail_clear_once = fail_clear_once
+        self.fail_process_once = fail_process_once
+        self.fail_begin = fail_begin
+        self.accepted = []
+        self.draft_calls = []
+
+    def clear(self):
+        self.events.append(("draft_clear",))
+        if self.fail_clear_once:
+            self.fail_clear_once = False
+            raise RuntimeError("injected draft clear failure")
+
+    def _process_batch(self, batch):
+        super()._process_batch(batch)
+        if self.fail_process_once:
+            self.fail_process_once = False
+            raise RuntimeError("injected native process failure")
+
+    def _begin(self, prompt):
+        values = np.asarray(prompt).astype(int).tolist()
+        self.events.append(("begin", values))
+        if self.fail_begin:
+            raise RuntimeError("injected native begin failure")
+
+    def __call__(self, input_ids, **kwargs):
+        self.draft_calls.append(np.asarray(input_ids).astype(int).tolist())
+        return np.asarray([30, 40], dtype=np.intc)
+
+    def accept(self, count):
+        self.accepted.append(count)
+
+    def memory_seq_rm(self, p0, p1):
+        self.events.append(("draft_rm", p0, p1))
+
+
+def _make_reprefill_llama(
+    *,
+    fail_target_clear_once=False,
+    fail_draft_clear_once=False,
+    fail_decode_once=False,
+    fail_process_once=False,
+    fail_begin=False,
+):
+    llm = object.__new__(Llama)
+    events = []
+    llm._ctx = _ReprefillContext(
+        events,
+        fail_clear_once=fail_target_clear_once,
+        fail_decode_once=fail_decode_once,
+    )
+    llm._batch = _EvalBatch()
+    llm._native_speculative = _ReprefillNative(
+        events,
+        fail_clear_once=fail_draft_clear_once,
+        fail_process_once=fail_process_once,
+        fail_begin=fail_begin,
+    )
+    llm.native_context_reprefill = True
+    llm._native_context_reprefill_in_progress = False
+    llm._native_context_reprefill_epoch = 0
+    llm._native_has_media_context = False
+    llm._native_context_reprefill_stats = {
+        "context_reprefill_count": 0,
+        "context_reprefill_tokens": 0,
+        "context_discarded_tokens": 0,
+        "context_reprefill_failures": 0,
+    }
+    llm._n_vocab = 256
+    llm._n_ctx = 12
+    llm.n_batch = 4
+    llm.n_keep = 2
+    llm.n_seq_max = 1
+    llm.n_tokens = 12
+    llm.input_ids = np.empty(12, dtype=np.intc)
+    llm.input_ids[:] = np.arange(1, 13, dtype=np.intc)
+    llm.scores = np.empty((1, 256), dtype=np.single)
+    llm._logits_all = False
+    llm.is_hybrid = False
+    llm._hybrid_cache_mgr = None
+    llm.verbose = False
+    return llm, events
+
+
+def test_native_context_reprefill_replays_prefix_and_recent_batches():
+    llm, events = _make_reprefill_llama()
+
+    llm.eval([13], copy_logits=False)
+
+    retained = [1, 2, 7, 8, 9, 10, 11, 12]
+    assert llm.input_ids[: llm.n_tokens].tolist() == retained + [13]
+    assert llm.n_tokens == 9
+    assert events == [
+        ("target_clear", True),
+        ("draft_clear",),
+        ("decode", 4),
+        ("process", 4),
+        ("decode", 4),
+        ("process", 4),
+        ("begin", retained),
+        ("decode", 1),
+        ("process", 1),
+    ]
+    assert llm.native_context_reprefill_stats == {
+        "context_reprefill_count": 1,
+        "context_reprefill_tokens": 8,
+        "context_discarded_tokens": 4,
+        "context_reprefill_failures": 0,
+    }
+
+
+@pytest.mark.parametrize(
+    "failure_kwargs",
+    [
+        {"fail_target_clear_once": True},
+        {"fail_draft_clear_once": True},
+        {"fail_decode_once": True},
+        {"fail_process_once": True},
+        {"fail_begin": True},
+    ],
+)
+def test_native_context_reprefill_failure_clears_both_contexts(failure_kwargs):
+    llm, events = _make_reprefill_llama(**failure_kwargs)
+
+    with pytest.raises(RuntimeError, match="clear-and-reprefill failed"):
+        llm.eval([13], copy_logits=False)
+
+    assert llm.n_tokens == 0
+    assert sum(event[0] == "target_clear" for event in events) >= 1
+    assert sum(event[0] == "draft_clear" for event in events) >= 1
+    assert llm.native_context_reprefill_stats["context_reprefill_failures"] == 1
+
+
+def test_native_context_reprefill_rejects_media_before_clearing():
+    llm, events = _make_reprefill_llama()
+    llm._native_has_media_context = True
+
+    with pytest.raises(RuntimeError, match="text-only.*multimodal"):
+        llm.eval([13], copy_logits=False)
+
+    assert events == []
+    assert llm.n_tokens == 12
+
+
+def test_native_context_reprefill_never_interrupts_atomic_verification():
+    llm, events = _make_reprefill_llama()
+
+    with pytest.raises(RuntimeError, match="in-flight"):
+        llm.eval([13], copy_logits=False, require_atomic=True)
+
+    assert events == []
+    assert llm.n_tokens == 12
+
+
+def test_native_context_reprefill_opt_out_preserves_context_error():
+    llm, events = _make_reprefill_llama()
+    llm.native_context_reprefill = False
+
+    with pytest.raises(RuntimeError, match="enable native_context_reprefill"):
+        llm.eval([13], copy_logits=False)
+
+    assert events == []
+
+
+def test_native_completion_length_only_bypasses_clamp_for_positive_opt_in():
+    llm, _ = _make_reprefill_llama()
+    prompt = [1, 2, 3]
+
+    assert llm._resolve_completion_max_tokens(prompt, 20) == 20
+    assert llm._resolve_completion_max_tokens(prompt, None) == 9
+    assert llm._resolve_completion_max_tokens(prompt, 0) == 9
+
+    llm.native_context_reprefill = False
+    assert llm._resolve_completion_max_tokens(prompt, 20) == 9
+
+    llm.native_context_reprefill = True
+    llm._native_has_media_context = True
+    assert llm._resolve_completion_max_tokens(prompt, 20) == 9
+
+
+def test_native_context_reprefill_requires_progress():
+    llm, _ = _make_reprefill_llama()
+    llm._n_ctx = 5
+
+    with pytest.raises(RuntimeError, match="no old tokens can be discarded"):
+        llm._native_speculative_retained_tokens([1], incoming_tokens=1)
+
+
+def test_native_generation_resumes_drafting_after_context_reprefill(monkeypatch):
+    llm, events = _make_reprefill_llama()
+    native = llm._native_speculative
+    llm.draft_model = native
+    llm._model = object()
+    llm._sampling_ctx = None
+    llm._seed = 123
+    llm._abort_event = threading.Event()
+
+    _GenerationSampler.outputs = [20, 21, 30, 40, 99]
+    _GenerationSampler.indices = []
+    monkeypatch.setattr(llama_module, "LlamaSamplingContext", _GenerationSampler)
+
+    generation = llm.generate(list(range(1, 13)), reset=True, temp=0.0)
+    assert [next(generation) for _ in range(5)] == [20, 21, 30, 40, 99]
+
+    assert llm.native_context_reprefill_stats["context_reprefill_count"] == 1
+    assert native.draft_calls
+    assert native.accepted == [2]
+    assert any(event[0] == "begin" and len(event[1]) == 8 for event in events)
+    generation.close()
