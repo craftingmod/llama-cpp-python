@@ -43,8 +43,12 @@ class _FakeBatch(ctypes.Structure):
 
 
 class _FakeModel:
-    def __init__(self, value=101):
+    def __init__(self, value=101, n_layer_nextn=1):
         self.model = ctypes.c_void_p(value)
+        self._n_layer_nextn = n_layer_nextn
+
+    def n_layer_nextn(self):
+        return self._n_layer_nextn
 
 
 class _FakeContext:
@@ -218,6 +222,27 @@ def test_native_mtp_configuration_uses_conservative_defaults(fake_native):
     assert draft.spec_type == "draft-mtp"
     assert draft.max_draft_tokens == 2
     assert draft.is_mtp is True
+    assert draft.is_internal_mtp is False
+    assert draft.supports_multimodal is False
+    assert draft.supports_context_reprefill is False
+    assert draft.supports_prefix_reuse is False
+    assert load_calls == []
+
+    draft.close()
+
+
+def test_native_internal_mtp_configuration_needs_no_draft_file(fake_native):
+    _native, load_calls = fake_native
+
+    draft = LlamaNativeSpeculativeDecoding(
+        model_path=None,
+        spec_type="draft-mtp",
+    )
+
+    assert draft.model_path is None
+    assert draft.max_draft_tokens == 2
+    assert draft.is_mtp is True
+    assert draft.is_internal_mtp is True
     assert draft.supports_multimodal is False
     assert draft.supports_context_reprefill is False
     assert draft.supports_prefix_reuse is False
@@ -243,9 +268,30 @@ def test_native_speculative_validates_configuration(kwargs, message):
         LlamaNativeSpeculativeDecoding("draft.gguf", **kwargs)
 
 
-def test_native_speculative_rejects_empty_model_path():
+@pytest.mark.parametrize("spec_type", ["draft-dflash", "draft-dspark"])
+def test_native_speculative_requires_model_path_for_external_types(spec_type):
     with pytest.raises((TypeError, ValueError), match="model path"):
-        LlamaNativeSpeculativeDecoding("")
+        LlamaNativeSpeculativeDecoding(None, spec_type=spec_type)
+
+
+@pytest.mark.parametrize(
+    "spec_type", ["draft-dflash", "draft-dspark", "draft-mtp"]
+)
+def test_native_speculative_rejects_empty_model_path(spec_type):
+    with pytest.raises((TypeError, ValueError), match="model path"):
+        LlamaNativeSpeculativeDecoding("", spec_type=spec_type)
+
+
+def test_native_external_mtp_still_validates_draft_file(monkeypatch):
+    monkeypatch.setattr(
+        "llama_cpp.llama_speculative.os.path.isfile", lambda path: False
+    )
+
+    with pytest.raises(ValueError, match="does not exist"):
+        LlamaNativeSpeculativeDecoding(
+            "missing-mtp.gguf",
+            spec_type="draft-mtp",
+        )
 
 
 @pytest.mark.parametrize(
@@ -286,6 +332,36 @@ def test_native_mtp_uses_existing_external_draft_abi(fake_native):
     draft.close()
 
 
+def test_native_internal_mtp_passes_null_draft_path_to_abi(fake_native):
+    native, _load_calls = fake_native
+    draft = LlamaNativeSpeculativeDecoding(
+        model_path=None,
+        spec_type="draft-mtp",
+    )
+
+    draft._bind(_FakeModel(n_layer_nextn=2), _FakeContext())
+
+    assert native.init_params is not None
+    assert native.init_params["model_path"] is None
+    assert native.init_params["spec_type"] == b"draft-mtp"
+    assert native.init_params["n_max"] == 2
+    draft.close()
+
+
+def test_native_internal_mtp_requires_target_nextn_layers(fake_native):
+    _native, load_calls = fake_native
+    draft = LlamaNativeSpeculativeDecoding(
+        model_path=None,
+        spec_type="draft-mtp",
+    )
+
+    with pytest.raises(ValueError, match="target GGUF.*NextN/MTP layers"):
+        draft._bind(_FakeModel(n_layer_nextn=0), _FakeContext())
+
+    assert load_calls == []
+    draft.close()
+
+
 def test_native_mtp_rejects_embedding_batch_before_bridge_call(fake_native):
     native, _load_calls = fake_native
     draft = LlamaNativeSpeculativeDecoding(
@@ -315,9 +391,10 @@ def test_native_mtp_rejects_embedding_batch_before_bridge_call(fake_native):
         ),
     ],
 )
-def test_native_mtp_rejects_unsupported_llama_modes(kwargs, message):
+@pytest.mark.parametrize("model_path", ["mtp.gguf", None])
+def test_native_mtp_rejects_unsupported_llama_modes(kwargs, message, model_path):
     draft = LlamaNativeSpeculativeDecoding(
-        "mtp.gguf",
+        model_path,
         spec_type="draft-mtp",
     )
 
@@ -325,6 +402,68 @@ def test_native_mtp_rejects_unsupported_llama_modes(kwargs, message):
         Llama("target.gguf", draft_model=draft, **kwargs)
 
     draft.close()
+
+
+def test_native_internal_mtp_enables_target_mtp_tensors_before_model_load(
+    monkeypatch,
+):
+    class _TargetLoadObserved(Exception):
+        pass
+
+    observed = {}
+
+    def observe_model_params(*, path_model, params, verbose):
+        observed["path_model"] = path_model
+        observed["load_mtp"] = bool(params.load_mtp)
+        observed["verbose"] = verbose
+        raise _TargetLoadObserved
+
+    monkeypatch.setattr(Llama, "_Llama__backend_initialized", True)
+    monkeypatch.setattr(llama_module.os.path, "exists", lambda path: True)
+    monkeypatch.setattr(
+        llama_module.llama_cpp_lib,
+        "llama_model_default_params",
+        lambda: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        llama_module.llama_cpp_lib,
+        "llama_context_default_params",
+        lambda: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        llama_module.internals,
+        "LlamaModel",
+        observe_model_params,
+    )
+
+    draft = LlamaNativeSpeculativeDecoding(
+        model_path=None,
+        spec_type="draft-mtp",
+    )
+    with pytest.raises(_TargetLoadObserved):
+        Llama(
+            "target.gguf",
+            draft_model=draft,
+            load_mtp=False,
+            verbose=False,
+        )
+
+    assert observed == {
+        "path_model": "target.gguf",
+        "load_mtp": True,
+        "verbose": False,
+    }
+    draft.close()
+
+
+def test_native_internal_mtp_rejects_grammar_before_generation():
+    llm = object.__new__(Llama)
+    llm._native_speculative = SimpleNamespace(is_internal_mtp=True)
+
+    generation = llm.generate([1], grammar=object())
+
+    with pytest.raises(ValueError, match="internal draft-mtp.*grammar"):
+        next(generation)
 
 
 def test_native_speculative_forwards_lifecycle_and_runtime_calls(fake_native):

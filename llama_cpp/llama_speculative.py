@@ -22,8 +22,8 @@ class LlamaNativeSpeculativeDecoding(LlamaDraftModel):
 
     The draft model is loaded lazily when this object is attached to ``Llama``.
     This implementation intentionally supports one sequence. DFlash and DSpark
-    can also mirror supported image batches; external Gemma 4 MTP assistants are
-    currently text-only.
+    can also mirror supported image batches. Both external MTP assistants and
+    embedded/internal MTP layers are currently text-only.
     """
 
     is_native = True
@@ -36,7 +36,7 @@ class LlamaNativeSpeculativeDecoding(LlamaDraftModel):
 
     def __init__(
         self,
-        model_path: str,
+        model_path: Optional[str] = None,
         *,
         spec_type: Literal[
             "draft-dflash", "draft-dspark", "draft-mtp"
@@ -56,15 +56,30 @@ class LlamaNativeSpeculativeDecoding(LlamaDraftModel):
         no_perf: bool = False,
         verbose: bool = True,
     ) -> None:
-        if not os.path.isfile(model_path):
-            raise ValueError(f"Draft model path does not exist: {model_path}")
-
         normalized_type = spec_type.strip().lower()
         if normalized_type not in self._SUPPORTED_TYPES:
             raise ValueError(
                 "spec_type must be 'draft-dflash', 'draft-dspark', or "
                 "'draft-mtp' in this experimental implementation"
             )
+
+        if model_path is None:
+            if normalized_type != "draft-mtp":
+                raise ValueError(
+                    f"A draft model path is required for {normalized_type}"
+                )
+            normalized_model_path = None
+        else:
+            normalized_model_path = os.fspath(model_path)
+            if not normalized_model_path:
+                raise ValueError(
+                    f"A draft model path is required for {normalized_type}"
+                )
+            if not os.path.isfile(normalized_model_path):
+                raise ValueError(
+                    f"Draft model path does not exist: {normalized_model_path}"
+                )
+
         if n_max is None:
             n_max = self._DEFAULT_N_MAX[normalized_type]
         if n_max <= 0:
@@ -78,7 +93,7 @@ class LlamaNativeSpeculativeDecoding(LlamaDraftModel):
         if n_threads_batch is not None and n_threads_batch <= 0:
             raise ValueError("n_threads_batch must be greater than zero")
 
-        self.model_path = os.fspath(model_path)
+        self.model_path = normalized_model_path
         self.spec_type = normalized_type
         self.n_max = int(n_max)
         self.n_min = int(n_min)
@@ -116,6 +131,11 @@ class LlamaNativeSpeculativeDecoding(LlamaDraftModel):
     def is_mtp(self) -> bool:
         """Whether this decoder uses llama.cpp's MTP implementation."""
         return self.spec_type == "draft-mtp"
+
+    @property
+    def is_internal_mtp(self) -> bool:
+        """Whether MTP layers come from the target GGUF itself."""
+        return self.is_mtp and self.model_path is None
 
     @property
     def supports_multimodal(self) -> bool:
@@ -209,10 +229,18 @@ class LlamaNativeSpeculativeDecoding(LlamaDraftModel):
                 "A native speculative decoder instance cannot be shared by multiple Llama instances"
             )
 
+        if self.is_internal_mtp and int(model.n_layer_nextn()) <= 0:
+            raise ValueError(
+                "Embedded native MTP requires a target GGUF containing usable "
+                "NextN/MTP layers."
+            )
+
         native = self._load_native_module()
         params = native.llama_cpp_native_speculative_params()
         params.struct_size = ctypes.sizeof(native.llama_cpp_native_speculative_params)
-        params.model_path = os.fsencode(self.model_path)
+        params.model_path = (
+            None if self.model_path is None else os.fsencode(self.model_path)
+        )
         params.spec_type = self.spec_type.encode("ascii")
         params.n_gpu_layers = self.n_gpu_layers
         params.n_ctx = int(context.n_ctx())

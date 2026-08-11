@@ -19,7 +19,7 @@ from llama_cpp._ctypes_extensions import (
 )
 
 
-LLAMA_CPP_NATIVE_SPECULATIVE_ABI_VERSION = 1
+LLAMA_CPP_NATIVE_SPECULATIVE_ABI_VERSION = 2
 
 
 def _load_llama_common() -> ctypes.CDLL:

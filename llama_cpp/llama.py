@@ -229,7 +229,8 @@ class Llama:
             use_extra_bufts: use extra buffer types (used for weight repacking)
             no_host: bypass host buffer allowing extra buffers to be used
             no_alloc: only load metadata and simulate memory allocations
-            load_mtp: whether to load MTP layers
+            load_mtp: whether to load MTP layers. This is enabled automatically
+                when ``draft_model`` uses embedded/internal MTP.
             seed: RNG seed, -1 for random
             n_ctx: Text context, 0 = from model
             n_keep: Number of tokens to keep from initial prompt
@@ -429,7 +430,20 @@ class Llama:
         self.model_params.use_extra_bufts = use_extra_bufts
         self.model_params.no_host = no_host
         self.model_params.no_alloc = no_alloc
-        self.model_params.load_mtp = load_mtp
+        # Embedded MTP tensors belong to the target GGUF and must be retained
+        # while that model is loaded. The native decoder is not bound until
+        # after target context creation, so this cannot be deferred to _bind().
+        self.model_params.load_mtp = bool(
+            load_mtp
+            or (
+                self._native_speculative is not None
+                and getattr(
+                    self._native_speculative,
+                    "is_internal_mtp",
+                    False,
+                )
+            )
+        )
 
         # Logic of cpu_moe, n_cpu_moe
         # Reference from llama.cpp/tools/llama-bench/llama-bench.cpp
@@ -2001,6 +2015,14 @@ class Llama:
                 raise ValueError(
                     "Custom logits_processor callbacks are not supported by "
                     "experimental native speculative decoding"
+                )
+            if (
+                grammar is not None
+                and getattr(native_speculative, "is_internal_mtp", False)
+            ):
+                raise ValueError(
+                    "Experimental internal draft-mtp does not support "
+                    "grammar-constrained generation"
                 )
             if (
                 not getattr(native_speculative, "supports_multimodal", True)

@@ -16,11 +16,19 @@
 #include <string>
 #include <vector>
 
+enum class llama_cpp_native_speculative_provider_kind {
+    external_draft,
+    external_mtp,
+    internal_mtp,
+};
+
 struct llama_cpp_native_speculative {
     common_params params;
     common_speculative_init_result_ptr draft_init;
     common_speculative * speculative = nullptr;
     common_speculative_type type = COMMON_SPECULATIVE_TYPE_NONE;
+    llama_cpp_native_speculative_provider_kind provider =
+            llama_cpp_native_speculative_provider_kind::external_draft;
 
     llama_context * target_context = nullptr;
     llama_context * draft_context  = nullptr;
@@ -72,6 +80,23 @@ bool is_supported_type(common_speculative_type type) {
         default:
             return false;
     }
+}
+
+const char * provider_kind_name(llama_cpp_native_speculative_provider_kind provider) {
+    switch (provider) {
+        case llama_cpp_native_speculative_provider_kind::external_draft:
+            return "external draft";
+        case llama_cpp_native_speculative_provider_kind::external_mtp:
+            return "external MTP";
+        case llama_cpp_native_speculative_provider_kind::internal_mtp:
+            return "internal MTP";
+    }
+
+    return "unknown";
+}
+
+bool is_internal_mtp(const llama_cpp_native_speculative * speculative) {
+    return speculative->provider == llama_cpp_native_speculative_provider_kind::internal_mtp;
 }
 
 void assign_tokens(llama_tokens & dst, const int32_t * tokens, size_t count) {
@@ -190,9 +215,6 @@ llama_cpp_native_speculative * llama_cpp_native_speculative_init(
         if (params->struct_size != sizeof(llama_cpp_native_speculative_params)) {
             throw std::invalid_argument("native speculative parameter ABI mismatch");
         }
-        if (params->model_path == nullptr || params->model_path[0] == '\0') {
-            throw std::invalid_argument("draft model path is required");
-        }
         if (params->spec_type == nullptr || params->spec_type[0] == '\0') {
             throw std::invalid_argument("speculative type is required");
         }
@@ -212,9 +234,30 @@ llama_cpp_native_speculative * llama_cpp_native_speculative_init(
                     std::string("unsupported experimental native speculative type: ") + params->spec_type);
         }
 
+        const bool has_model_path = params->model_path != nullptr && params->model_path[0] != '\0';
+        llama_cpp_native_speculative_provider_kind provider;
+        if (type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            provider = has_model_path
+                    ? llama_cpp_native_speculative_provider_kind::external_mtp
+                    : llama_cpp_native_speculative_provider_kind::internal_mtp;
+        } else {
+            if (!has_model_path) {
+                throw std::invalid_argument(
+                        std::string("a draft model path is required for ") + params->spec_type);
+            }
+            provider = llama_cpp_native_speculative_provider_kind::external_draft;
+        }
+
+        if (provider == llama_cpp_native_speculative_provider_kind::internal_mtp &&
+            llama_model_n_layer_nextn(target_model) <= 0) {
+            throw std::runtime_error(
+                    "embedded native MTP requires a target GGUF containing usable NextN/MTP layers");
+        }
+
         auto result = std::make_unique<llama_cpp_native_speculative>();
         result->target_context = target_context;
         result->type           = type;
+        result->provider       = provider;
 
         common_params & base = result->params;
         base.n_ctx      = params->n_ctx > 0 ? params->n_ctx : (int32_t) llama_n_ctx(target_context);
@@ -232,7 +275,14 @@ llama_cpp_native_speculative * llama_cpp_native_speculative_init(
 
         auto & draft = base.speculative.draft;
         base.speculative.types = { type };
-        draft.mparams.path      = params->model_path;
+        if (has_model_path) {
+            draft.mparams.path = params->model_path;
+        } else {
+            // An empty draft model descriptor is how llama.cpp/common selects
+            // an embedded target-model MTP context instead of loading a second
+            // GGUF. In particular, never assign a null C string to std::string.
+            draft.mparams.path.clear();
+        }
         draft.n_gpu_layers      = params->n_gpu_layers;
         draft.n_max             = params->n_max;
         draft.n_min             = std::max(0, params->n_min);
@@ -255,11 +305,20 @@ llama_cpp_native_speculative * llama_cpp_native_speculative_init(
 
         llama_model * draft_model = result->draft_init->model();
         result->draft_context     = result->draft_init->context();
-        if (draft_model == nullptr || result->draft_context == nullptr) {
+        if (result->draft_context == nullptr) {
+            if (provider == llama_cpp_native_speculative_provider_kind::internal_mtp) {
+                throw std::runtime_error(
+                        "failed to create an embedded MTP context from the target model; "
+                        "ensure its NextN/MTP tensors were loaded and this architecture supports an MTP graph");
+            }
+            throw std::runtime_error(std::string("failed to load draft model: ") + params->model_path);
+        }
+        if (provider != llama_cpp_native_speculative_provider_kind::internal_mtp &&
+            draft_model == nullptr) {
             throw std::runtime_error(std::string("failed to load draft model: ") + params->model_path);
         }
 
-        if (type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+        if (provider == llama_cpp_native_speculative_provider_kind::external_mtp) {
             const std::string target_arch = model_architecture(target_model);
             const std::string draft_arch  = model_architecture(draft_model);
             if (target_arch != "gemma4") {
@@ -306,6 +365,48 @@ llama_cpp_native_speculative * llama_cpp_native_speculative_init(
                     "(%d heads, shared target KV, n_max=%d)\n",
                     n_mtp_layers,
                     params->n_max);
+        } else if (provider == llama_cpp_native_speculative_provider_kind::internal_mtp) {
+            // llama.cpp/common intentionally owns only the embedded MTP context
+            // in this mode; its init-result model pointer is null because the
+            // target model remains owned by Python's Llama instance.
+            const llama_model * context_model = llama_get_model(result->draft_context);
+            if (context_model != target_model) {
+                throw std::runtime_error(
+                        "embedded MTP context was not created against the target model");
+            }
+            if (llama_get_memory(target_context) == nullptr) {
+                throw std::runtime_error(
+                        "embedded native MTP requires a target context with usable memory");
+            }
+            if (llama_get_memory(result->draft_context) == nullptr) {
+                throw std::runtime_error(
+                        "embedded native MTP context was created without usable memory");
+            }
+
+            result->shares_target_memory =
+                    llama_get_ctx_other(result->draft_context) == target_context;
+
+            const int32_t n_mtp_layers = llama_model_n_layer_nextn(context_model);
+            if (n_mtp_layers <= 0) {
+                throw std::runtime_error(
+                        "embedded native MTP requires a target GGUF containing usable NextN/MTP layers");
+            }
+
+            const int32_t target_width = llama_model_n_embd_out(target_model);
+            const int32_t draft_width  = llama_model_n_embd_out(context_model);
+            if (target_width <= 0 || target_width != draft_width) {
+                throw std::runtime_error(
+                        "target and embedded MTP context hidden widths do not match (target=" +
+                        std::to_string(target_width) + ", MTP=" +
+                        std::to_string(draft_width) + ")");
+            }
+
+            COM_INF(
+                    "native speculative bridge: embedded MTP context recognized "
+                    "(%d heads, %s memory, n_max=%d)\n",
+                    n_mtp_layers,
+                    result->shares_target_memory ? "shared target" : "independent",
+                    params->n_max);
         }
 
         draft.ctx_tgt = target_context;
@@ -314,6 +415,11 @@ llama_cpp_native_speculative * llama_cpp_native_speculative_init(
         if (result->speculative == nullptr) {
             throw std::runtime_error("failed to initialize llama.cpp common speculative decoder");
         }
+
+        COM_INF(
+                "native speculative bridge: initialized %s provider for %s\n",
+                provider_kind_name(provider),
+                params->spec_type);
 
         copy_error(error, error_capacity, "");
         return result.release();
@@ -534,23 +640,57 @@ bool llama_cpp_native_speculative_memory_clear(
         return false;
     }
 
-    auto * memory = llama_get_memory(speculative->draft_context);
-    if (memory == nullptr) {
-        return set_error(speculative, "draft context has no memory object");
+    try {
+        auto * memory = llama_get_memory(speculative->draft_context);
+        if (memory == nullptr) {
+            return set_error(speculative, "draft context has no memory object");
+        }
+        // Gemma 4 assistant contexts share the target cache's cell ledger.
+        // Python clears the target first; clearing this shared view again would
+        // also erase live target state if callers invoked draft.clear()
+        // independently. Embedded MTP contexts with independent memory are
+        // cleared here exactly once.
+        if (!speculative->shares_target_memory) {
+            llama_memory_clear(memory, clear_data);
+        }
+        llama_synchronize(speculative->draft_context);
+
+        speculative->prompt.clear();
+        speculative->result.clear();
+        speculative->has_last_draft = false;
+        speculative->last_draft_verified = false;
+
+        if (is_internal_mtp(speculative)) {
+            // common_speculative_impl_draft_mtp keeps pending_h/verify_h outside
+            // the context memory. Its begin() hook deliberately does not reset
+            // them, so retaining the implementation after a full clear would
+            // feed the previous request's final hidden row into position zero of
+            // the next request. Recreate only the implementation; draft_init
+            // continues to own the already-cleared MTP context.
+            if (speculative->speculative != nullptr) {
+                common_speculative_free(speculative->speculative);
+                speculative->speculative = nullptr;
+            }
+
+            auto & draft = speculative->params.speculative.draft;
+            draft.ctx_tgt = speculative->target_context;
+            draft.ctx_dft = speculative->draft_context;
+            speculative->speculative = common_speculative_init(
+                    speculative->params.speculative, 1);
+            if (speculative->speculative == nullptr) {
+                return set_error(
+                        speculative,
+                        "failed to reset embedded MTP state after clearing its context");
+            }
+        }
+
+        speculative->last_error.clear();
+        return true;
+    } catch (const std::exception & exc) {
+        return set_error(speculative, exc.what());
+    } catch (...) {
+        return set_error(speculative, "unknown native speculative clear error");
     }
-    // Gemma 4 assistant contexts share the target cache's cell ledger. Python
-    // clears the target first; clearing this shared view again would also erase
-    // live target state if callers invoked draft.clear() independently.
-    if (!speculative->shares_target_memory) {
-        llama_memory_clear(memory, clear_data);
-    }
-    llama_synchronize(speculative->draft_context);
-    speculative->prompt.clear();
-    speculative->result.clear();
-    speculative->has_last_draft = false;
-    speculative->last_draft_verified = false;
-    speculative->last_error.clear();
-    return true;
 }
 
 void llama_cpp_native_speculative_print_stats(

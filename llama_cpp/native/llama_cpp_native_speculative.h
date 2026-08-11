@@ -23,11 +23,13 @@ struct llama_batch;
 // targets a single text sequence for now.
 typedef struct llama_cpp_native_speculative llama_cpp_native_speculative;
 
-#define LLAMA_CPP_NATIVE_SPECULATIVE_ABI_VERSION 1u
+#define LLAMA_CPP_NATIVE_SPECULATIVE_ABI_VERSION 2u
 
 typedef struct llama_cpp_native_speculative_params {
     uint32_t struct_size;
 
+    // Null or empty selects embedded target-model MTP for draft-mtp only.
+    // All external draft providers require a non-empty model path.
     const char * model_path;
     const char * spec_type;
 
