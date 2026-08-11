@@ -2932,10 +2932,22 @@ class Llama:
                 if self.verbose:
                     print("Llama._create_completion: cache miss", file=sys.stderr)
 
-        if stopping_criteria is None:
-            stopping_criteria = StoppingCriteriaList([AbortCriteria(self._abort_event)])
-        else:
-            stopping_criteria.append(AbortCriteria(self._abort_event))
+        request_stopping_criteria = StoppingCriteriaList(stopping_criteria or [])
+        request_stopping_criteria.append(AbortCriteria(self._abort_event))
+        stopping_criteria_triggered = False
+
+        def tracked_stopping_criteria(
+            input_ids: npt.NDArray[np.intc],
+            logits: npt.NDArray[np.single],
+        ) -> bool:
+            nonlocal stopping_criteria_triggered
+            triggered = request_stopping_criteria(input_ids, logits)
+            stopping_criteria_triggered = stopping_criteria_triggered or triggered
+            return triggered
+
+        generation_stopping_criteria = StoppingCriteriaList(
+            [tracked_stopping_criteria]
+        )
 
         finish_reason = "length"
         multibyte_fix = 0
@@ -2964,7 +2976,7 @@ class Llama:
             present_penalty=present_penalty,
             repeat_penalty=repeat_penalty,
             penalty_last_n=penalty_last_n,
-            stopping_criteria=stopping_criteria,
+            stopping_criteria=generation_stopping_criteria,
             adaptive_target=adaptive_target,
             adaptive_decay=adaptive_decay,
             use_infill=use_infill,
@@ -3165,9 +3177,7 @@ class Llama:
                 finish_reason = "length"
                 break
 
-        if stopping_criteria is not None and stopping_criteria(
-            self._input_ids, self._scores[-1, :]
-        ):
+        if stopping_criteria_triggered:
             text = self.detokenize(completion_tokens, prev_tokens=prompt_tokens)
             finish_reason = "stop"
 

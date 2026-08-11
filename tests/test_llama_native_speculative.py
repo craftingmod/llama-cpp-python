@@ -695,6 +695,96 @@ def test_native_generation_supports_token_stopping_criteria(monkeypatch):
     assert native.removals == [(3, -1)]
 
 
+def test_completion_preserves_native_stop_trigger_without_sampled_token_history(
+    monkeypatch,
+):
+    class _CompletionModel:
+        vocab = object()
+
+        def token_bos(self):
+            return -1
+
+        def token_eos(self):
+            return -1
+
+        def token_sep(self):
+            return -1
+
+        def token_fim_pre(self):
+            return -1
+
+        def token_fim_mid(self):
+            return -1
+
+        def token_fim_suf(self):
+            return -1
+
+        def get_add_bos(self):
+            return False
+
+        def get_add_eos(self):
+            return False
+
+        def get_add_sep(self):
+            return False
+
+    llm = object.__new__(Llama)
+    llm._model = _CompletionModel()
+    llm._abort_event = threading.Event()
+    llm.metadata = {}
+    llm.spm_infill = False
+    llm._n_ctx = 32
+    llm._native_speculative = object()
+    llm.native_context_reprefill = False
+    llm.n_seq_max = 1
+    llm._native_has_media_context = False
+    llm.n_tokens = 1
+    llm.input_ids = np.zeros(32, dtype=np.intc)
+    llm.input_ids[0] = 10
+    llm.scores = np.zeros((1, 256), dtype=np.single)
+    llm._logits_all = False
+    llm._seed = 42
+    llm.cache = None
+    llm.verbose = False
+    llm.model_path = "target.gguf"
+
+    def fake_generate(tokens, *, stopping_criteria, **kwargs):
+        del kwargs
+        logits = np.zeros(256, dtype=np.single)
+        assert not stopping_criteria(np.asarray([*tokens, 20]), logits)
+        yield 20
+        assert stopping_criteria(np.asarray([*tokens, 20, 30]), logits)
+
+    def stop_on_30(input_ids, logits):
+        del logits
+        return int(input_ids[-1]) == 30
+
+    llm.generate = fake_generate
+    llm.detokenize = lambda tokens, **kwargs: (
+        b"answer" if list(tokens) == [20] else b""
+    )
+    monkeypatch.setattr(
+        llama_module.llama_cpp_lib,
+        "llama_token_is_eog",
+        lambda vocab, token: False,
+    )
+
+    criteria = llama_module.StoppingCriteriaList([stop_on_30])
+    (response,) = list(
+        llm._create_completion(
+            [10],
+            max_tokens=8,
+            temperature=0.0,
+            stopping_criteria=criteria,
+        )
+    )
+
+    assert response["choices"][0]["text"] == "answer"
+    assert response["choices"][0]["finish_reason"] == "stop"
+    assert response["usage"]["completion_tokens"] == 1
+    assert criteria == [stop_on_30]
+
+
 class _ReprefillContext(_EvalContext):
     def __init__(self, events, *, fail_clear_once=False, fail_decode_once=False):
         super().__init__(events, [])
