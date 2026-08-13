@@ -1187,11 +1187,20 @@ class Llama:
         self._seed = seed
 
     def reset(self):
-        """Reset the model state."""
+        """Clear the model context and reset the token cursor."""
+        # n_tokens is only the Python-side cursor.  Clear llama.cpp's memory as
+        # well so a new request can safely decode at position 0.  This matters
+        # for both ordinary KV caches and recurrent/hybrid SWA memory.
+        self._ctx.memory_clear(True)
+
+        hybrid_cache_mgr = getattr(self, "_hybrid_cache_mgr", None)
+        if hybrid_cache_mgr is not None:
+            hybrid_cache_mgr.clear()
+
         if self._native_speculative is not None:
-            self._ctx.memory_clear(True)
             self._native_speculative.clear()
-            self._native_has_media_context = False
+
+        self._native_has_media_context = False
         self.n_tokens = 0
 
     @property
