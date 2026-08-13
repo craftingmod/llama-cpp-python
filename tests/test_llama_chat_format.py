@@ -3,6 +3,7 @@ import numpy as np
 import pytest
 
 from llama_cpp.llama_chat_format import Jinja2ChatFormatter
+from llama_cpp.llama_multimodal import Gemma4ChatHandler
 
 QWEN35_EOS_TOKEN = "<|im_end|>"
 
@@ -101,6 +102,37 @@ QWEN35_CHAT_TEMPLATE = r"""
     {%- endif %}
 {%- endif %}
 """
+
+
+@pytest.mark.parametrize(
+    ("content", "expected_video_url"),
+    [
+        ({"type": "video_url", "video_url": "video.mp4"}, "video.mp4"),
+        (
+            {"type": "video_url", "video_url": {"url": "nested-video.mp4"}},
+            "nested-video.mp4",
+        ),
+        ({"type": "video", "video": "video.mp4"}, "video.mp4"),
+        (
+            {"type": "video", "video": {"url": "nested-video.mp4"}},
+            "nested-video.mp4",
+        ),
+    ],
+)
+def test_gemma4_video_content_uses_current_item(content, expected_video_url):
+    formatter = Jinja2ChatFormatter(
+        template=Gemma4ChatHandler.CHAT_FORMAT,
+        eos_token=Gemma4ChatHandler.GEMMA4_EOS_TOKEN,
+        bos_token=Gemma4ChatHandler.GEMMA4_BOS_TOKEN,
+        add_generation_prompt=False,
+    )
+
+    response = formatter(
+        messages=[{"role": "user", "content": [content]}],
+        enable_thinking=False,
+    )
+
+    assert f"<|video|>{expected_video_url}" in response.prompt
 
 
 @pytest.fixture()
