@@ -104,7 +104,7 @@ class Llama:
         cpu_moe: bool = False,
         n_cpu_moe: int = 0,
         split_mode: int = llama_cpp_lib.llama_split_mode.LLAMA_SPLIT_MODE_LAYER,
-        load_mode: int = llama_cpp_lib.llama_load_mode.LLAMA_LOAD_MODE_MMAP,
+        load_mode: int = llama_cpp_lib.llama_load_mode.LLAMA_LOAD_MODE_AUTO,
         main_gpu: int = 0,
         tensor_split: Optional[List[float]] = None,
         kv_overrides: Optional[Dict[str, Union[bool, int, float, str]]] = None,
@@ -1187,20 +1187,24 @@ class Llama:
         self._seed = seed
 
     def reset(self):
-        """Clear the model context and reset the token cursor."""
-        # n_tokens is only the Python-side cursor.  Clear llama.cpp's memory as
-        # well so a new request can safely decode at position 0.  This matters
-        # for both ordinary KV caches and recurrent/hybrid SWA memory.
+        """Reset all Python and native model state."""
+        # Use a full memory clear rather than sequence removal: recurrent state
+        # cannot always be partially truncated, and hybrid memory must clear
+        # both its attention KV cache and recurrent state.
         self._ctx.memory_clear(True)
-
+        
+        # Hybrid checkpoints contain snapshots of the state cleared above and
+        # must not be reused after a reset.
         hybrid_cache_mgr = getattr(self, "_hybrid_cache_mgr", None)
         if hybrid_cache_mgr is not None:
             hybrid_cache_mgr.clear()
 
+        # Also clear native speculative cache.
         if self._native_speculative is not None:
             self._native_speculative.clear()
 
         self._native_has_media_context = False
+
         self.n_tokens = 0
 
     @property
@@ -2172,13 +2176,7 @@ class Llama:
                                 )
         if reset:
             # No prefix matched at all. Completely clear the KV cache to prevent context poisoning.
-            self.n_tokens = 0
-            self._ctx.memory_clear(True)
-            if native_speculative is not None:
-                native_speculative.clear()
-                self._native_has_media_context = False
-            if self.is_hybrid and self._hybrid_cache_mgr is not None:
-                self._hybrid_cache_mgr.clear()
+            self.reset()
             if self.verbose:
                 print("Llama.generate: Context reset requested or no prefix match. Cleared KV cache.", file=sys.stderr)
 
