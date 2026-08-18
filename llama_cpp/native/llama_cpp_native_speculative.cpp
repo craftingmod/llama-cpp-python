@@ -319,6 +319,7 @@ llama_cpp_native_speculative * llama_cpp_native_speculative_init(
         }
 
         if (provider == llama_cpp_native_speculative_provider_kind::external_mtp) {
+            /*
             const std::string target_arch = model_architecture(target_model);
             const std::string draft_arch  = model_architecture(draft_model);
             if (target_arch != "gemma4") {
@@ -331,25 +332,26 @@ llama_cpp_native_speculative * llama_cpp_native_speculative_init(
                         "external draft-mtp currently requires a Gemma 4 assistant GGUF "
                         "(general.architecture=gemma4-assistant)");
             }
+            */
 
             result->shares_target_memory =
                     llama_get_ctx_other(result->draft_context) == target_context;
             if (!result->shares_target_memory) {
                 throw std::runtime_error(
-                        "Gemma 4 MTP assistant context did not attach to the target context");
+                        "MTP assistant context did not attach to the target context");
             }
 
             const int32_t n_mtp_layers = llama_model_n_layer_nextn(draft_model);
             if (n_mtp_layers <= 0) {
                 throw std::runtime_error(
-                        "Gemma 4 MTP assistant has no next-token prediction layers");
+                        "MTP assistant has no next-token prediction layers");
             }
 
             const int32_t target_width = llama_model_n_embd_out(target_model);
             const int32_t draft_width  = llama_model_n_embd_out(draft_model);
             if (target_width <= 0 || target_width != draft_width) {
                 throw std::runtime_error(
-                        "Gemma 4 target and MTP assistant hidden widths do not match (target=" +
+                        "Model target and MTP assistant hidden widths do not match (target=" +
                         std::to_string(target_width) + ", assistant=" +
                         std::to_string(draft_width) + ")");
             }
@@ -357,11 +359,11 @@ llama_cpp_native_speculative * llama_cpp_native_speculative_init(
             std::string vocab_error;
             if (!mtp_vocabs_are_compatible(target_model, draft_model, vocab_error)) {
                 throw std::runtime_error(
-                        "Gemma 4 target and MTP assistant are incompatible: " + vocab_error);
+                        "Model and MTP assistant are incompatible: " + vocab_error);
             }
 
             COM_INF(
-                    "native speculative bridge: Gemma 4 MTP assistant recognized "
+                    "native speculative bridge: MTP assistant recognized "
                     "(%d heads, shared target KV, n_max=%d)\n",
                     n_mtp_layers,
                     params->n_max);
