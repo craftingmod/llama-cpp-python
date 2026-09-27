@@ -2163,21 +2163,6 @@ def llama_adapter_lora_init(
     ...
 
 
-# // Load a LoRA adapter from an open FILE pointer, reading from its current position
-# LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init_from_file_ptr(
-#         struct llama_model * model,
-#         FILE * file);
-@ctypes_function(
-    "llama_adapter_lora_init_from_file_ptr",
-    [llama_model_p_ctypes, ctypes.c_void_p],
-    llama_adapter_lora_p_ctypes,
-)
-def llama_adapter_lora_init_from_file_ptr(
-    model: llama_model_p, file: ctypes.c_void_p, /
-) -> Optional[llama_adapter_lora_p]:
-    ...
-
-
 # // Functions to access the adapter's GGUF metadata scalar values
 # // - The functions return the length of the string on success, or -1 on failure
 # // - The output string is always null-terminated and cleared on failure
