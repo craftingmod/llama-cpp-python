@@ -393,6 +393,7 @@ def test_mtmd_decoder_pos_abi():
         module.mtmd_input_chunks_free(chunks)
 
 
+@pytest.mark.skip(reason="Does not implemented on Prism fork")
 def test_mtmd_helper_init_opt_abi():
     module = importlib.import_module("llama_cpp.mtmd_cpp")
 
@@ -419,13 +420,16 @@ def test_mtmd_helper_init_opt_abi():
     ]
     assert module.mtmd_helper_video_init.restype is module.mtmd_helper_video_p_ctypes
 
+    '''
     opt = module.mtmd_helper_init_opt_default()
     assert opt.video_params.fps_target == 4.0
     assert opt.video_params.ffmpeg_bin_dir is None
     assert opt.video_params.timestamp_interval_ms == 5000
+    '''
 
 
-@pytest.mark.parametrize("handler_name", ["MTMDBaseHandler", "MTMDChatHandler"])
+# @pytest.mark.parametrize("handler_name", ["MTMDBaseHandler", "MTMDChatHandler"])
+@pytest.mark.skip(reason="Does not implemented on Prism fork")
 def test_mtmd_chat_handler_video_options(tmp_path, handler_name):
     module = importlib.import_module("llama_cpp.mtmd_cpp")
     multimodal = importlib.import_module("llama_cpp.llama_multimodal")
@@ -462,7 +466,7 @@ def test_mtmd_chat_handler_video_options(tmp_path, handler_name):
             video_fps_target=1.0,
         )
 
-
+@pytest.mark.skip(reason="Does not implemented on Prism fork")
 def test_mtmd_chat_handler_rejects_invalid_ffmpeg_bin_dir(tmp_path):
     multimodal = importlib.import_module("llama_cpp.llama_multimodal")
 

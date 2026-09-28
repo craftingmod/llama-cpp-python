@@ -80,19 +80,6 @@ class mtmd_input_chunk_type(enum.IntEnum):
     MTMD_INPUT_CHUNK_TYPE_AUDIO = 2
     MTMD_INPUT_CHUNK_TYPE_COUNT = 3
 
-# // position indexing for decoder model
-# enum mtmd_pos_type {
-#     MTMD_POS_TYPE_NORMAL,    // number of positions equals to number of tokens
-#     MTMD_POS_TYPE_MROPE,     // qwen-vl mrope style, each image takes max(t,h,w) position indexes
-#     MTMD_POS_TYPE_HUNYUANVL, // HunyuanVL mrope + BOI/EOI/newline layout with XD-RoPE dim-3
-#     MTMD_POS_TYPE_COUNT,     // for validation
-# };
-class mtmd_pos_type(enum.IntEnum):
-    MTMD_POS_TYPE_NORMAL    = 0  # number of positions equals to number of tokens
-    MTMD_POS_TYPE_MROPE     = 1  # qwen-vl mrope style, each image takes max(t,h,w) position indexes
-    MTMD_POS_TYPE_HUNYUANVL = 2  # HunyuanVL mrope + BOI/EOI/newline layout with XD-RoPE dim-3
-    MTMD_POS_TYPE_COUNT     = 3  # for validation
-
 # // opaque types
 
 # struct mtmd_context;
@@ -197,20 +184,6 @@ class mtmd_input_text(Structure):
     ]
 mtmd_input_text_p = NewType("mtmd_input_text_p", int)
 mtmd_input_text_p_ctypes = POINTER(mtmd_input_text)
-
-# struct mtmd_input_part {
-#     // only text or bitmap can be set, not both
-#     const struct mtmd_input_text * text;
-#     const struct mtmd_bitmap * bitmap;
-# };
-class mtmd_input_part(Structure):
-    _fields_ = [
-        ("text", mtmd_input_text_p_ctypes),
-        ("bitmap", mtmd_bitmap_p_ctypes),
-    ]
-
-mtmd_input_part_p = NewType("mtmd_input_part_p", int)
-mtmd_input_part_p_ctypes = POINTER(mtmd_input_part)
 
 # enum clip_flash_attn_type {
 #     CLIP_FLASH_ATTN_TYPE_AUTO     = -1,
@@ -884,47 +857,6 @@ def mtmd_tokenize(
     ...
 
 
-# // same as mtmd_tokenize(), but takes an array of mtmd_input_part
-# // use cases:
-# // - when you don't want to use media markers (they will be tokenized as normal text)
-# // - when you want to control parse_special for each text part
-# // note: per-part add_special will be ignored
-# // return 1 if a part has both text and bitmap set (or neither)
-# MTMD_API int32_t mtmd_tokenize_from_parts(mtmd_context * ctx,
-#                                           mtmd_input_chunks * output,
-#                                           const mtmd_input_part ** parts,
-#                                           size_t n_parts,
-#                                           bool add_special);
-@ctypes_function_mtmd(
-    "mtmd_tokenize_from_parts", [
-        mtmd_context_p_ctypes,
-        mtmd_input_chunks_p_ctypes,
-        POINTER(mtmd_input_part_p_ctypes),
-        c_size_t,
-        c_bool,
-    ],
-    c_int32,
-)
-def mtmd_tokenize_from_parts(
-    ctx: mtmd_context_p,
-    output: mtmd_input_chunks_p,
-    parts: POINTER(mtmd_input_part_p_ctypes), # type: ignore
-    n_parts: c_size_t,
-    add_special: c_bool,
-    /,
-) -> c_int32:
-    """
-    same as mtmd_tokenize(), but takes an array of mtmd_input_part
-
-    use cases:
-     - when you don't want to use media markers (they will be tokenized as normal text)
-     - when you want to control parse_special for each text part
-
-    note: per-part add_special will be ignored.
-    return 1 if a part has both text and bitmap set (or neither)
-    """
-    ...
-
 # // returns 0 on success
 # // TODO: deprecate
 # DEPRECATED(MTMD_API int32_t mtmd_encode(mtmd_context * ctx, const mtmd_image_tokens * image_tokens),
@@ -1366,27 +1298,6 @@ def mtmd_helper_video_init_params_default() -> mtmd_helper_video_init_params:
     ...
 
 
-# struct mtmd_helper_init_opt {
-#     struct mtmd_helper_video_init_params video_params;
-# };
-class mtmd_helper_init_opt(Structure):
-    _fields_ = [
-        ("video_params", mtmd_helper_video_init_params),
-    ]
-mtmd_helper_init_opt_p_ctypes = POINTER(mtmd_helper_init_opt)
-
-
-# MTMD_API struct mtmd_helper_init_opt mtmd_helper_init_opt_default(void);
-@ctypes_function_mtmd(
-    "mtmd_helper_init_opt_default",
-    [],
-    mtmd_helper_init_opt,
-)
-def mtmd_helper_init_opt_default() -> mtmd_helper_init_opt:
-    """Get the default options for mtmd_helper_bitmap_init_from_*()."""
-    ...
-
-
 # // Set callback for all future logging events.
 # // If this is not called, or NULL is supplied, everything is output on stderr.
 # // Note: this also call mtmd_log_set() internally
@@ -1429,15 +1340,13 @@ mtmd_helper_bitmap_wrapper_p_ctypes = POINTER(mtmd_helper_bitmap_wrapper)
 # MTMD_API struct mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_file(
 #                     mtmd_context * ctx,
 #                     const char * fname,
-#                     bool placeholder,
-#                     struct mtmd_helper_init_opt opt);
+#                     bool placeholder);
 
 @ctypes_function_mtmd(
     "mtmd_helper_bitmap_init_from_file", [
         mtmd_context_p_ctypes,
         c_char_p,
         c_bool,
-        mtmd_helper_init_opt,
     ],
     mtmd_helper_bitmap_wrapper
 )
@@ -1445,7 +1354,6 @@ def mtmd_helper_bitmap_init_from_file(
     ctx: mtmd_context_p,
     fname: c_char_p,
     placeholder: c_bool,
-    opt: mtmd_helper_init_opt,
     /,
 ) -> mtmd_helper_bitmap_wrapper:
     """
@@ -1470,15 +1378,13 @@ def mtmd_helper_bitmap_init_from_file(
 # MTMD_API struct mtmd_helper_bitmap_wrapper mtmd_helper_bitmap_init_from_buf(
 #                     mtmd_context * ctx,
 #                     const unsigned char * buf, size_t len,
-#                     bool placeholder,
-#                     struct mtmd_helper_init_opt opt);
+#                     bool placeholder);
 @ctypes_function_mtmd(
     "mtmd_helper_bitmap_init_from_buf", [
         mtmd_context_p_ctypes,
         POINTER(c_uint8),
         c_size_t,
         c_bool,
-        mtmd_helper_init_opt,
     ],
     mtmd_helper_bitmap_wrapper
 )
@@ -1487,7 +1393,6 @@ def mtmd_helper_bitmap_init_from_buf(
     buf: CtypesArray[c_uint8],
     len: c_size_t,
     placeholder: c_bool,
-    opt: mtmd_helper_init_opt,
     /,
 ) -> mtmd_helper_bitmap_wrapper:
     """

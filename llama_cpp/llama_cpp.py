@@ -76,13 +76,13 @@ LLAMA_FILE_MAGIC_GGSQ = 0x67677371
 
 # define LLAMA_SESSION_MAGIC   LLAMA_FILE_MAGIC_GGSN
 LLAMA_SESSION_MAGIC = LLAMA_FILE_MAGIC_GGSN
-# define LLAMA_SESSION_VERSION 10
-LLAMA_SESSION_VERSION = 10
+# define LLAMA_SESSION_VERSION 9
+LLAMA_SESSION_VERSION = 9
 
 # define LLAMA_STATE_SEQ_MAGIC   LLAMA_FILE_MAGIC_GGSQ
 LLAMA_STATE_SEQ_MAGIC = LLAMA_FILE_MAGIC_GGSQ
-# define LLAMA_STATE_SEQ_VERSION 3
-LLAMA_STATE_SEQ_VERSION = 3
+# define LLAMA_STATE_SEQ_VERSION 2
+LLAMA_STATE_SEQ_VERSION = 2
 
 # struct llama_vocab;
 llama_vocab_p = NewType("llama_vocab_p", int)
@@ -125,7 +125,6 @@ llama_seq_id = ctypes.c_int32
 #     LLAMA_VOCAB_TYPE_UGM    = 4, // T5 tokenizer based on Unigram
 #     LLAMA_VOCAB_TYPE_RWKV   = 5, // RWKV tokenizer based on greedy tokenization
 #     LLAMA_VOCAB_TYPE_PLAMO2 = 6, // PLaMo-2 tokenizer based on Aho-Corasick with dynamic programming
-#     LLAMA_VOCAB_TYPE_TEST   = 7, // Dummy tokenizer for testing: rolling hash of fixed-size chunks -> tokens, tokens -> hex
 # };
 class llama_vocab_type(enum.IntEnum):
     LLAMA_VOCAB_TYPE_NONE   = 0
@@ -142,8 +141,6 @@ class llama_vocab_type(enum.IntEnum):
     """RWKV tokenizer based on greedy tokenization"""
     LLAMA_VOCAB_TYPE_PLAMO2 = 6
     """PLaMo-2 tokenizer based on Aho-Corasick with dynamic programming"""
-    LLAMA_VOCAB_TYPE_TEST   = 7
-    """Dummy tokenizer for testing: rolling hash of fixed-size chunks -> tokens, tokens -> hex"""
 
 
 # NOTE: Deprecated and will be removed in the future. (already gone in llama.cpp)
@@ -376,6 +373,9 @@ LLAMA_TOKEN_ATTR_SINGLE_WORD = 1 << 9
 #     LLAMA_FTYPE_MOSTLY_NVFP4         = 39, // except 1d tensors
 #     LLAMA_FTYPE_MOSTLY_Q1_0          = 40, // except 1d tensors
 #     LLAMA_FTYPE_MOSTLY_Q2_0          = 41, // except 1d tensors
+#     LLAMA_FTYPE_MOSTLY_PQ2_0         = 141, // except 1d tensors (Prism group-128 Q2_0; matches published PQ2_0 ggufs)
+#     LLAMA_FTYPE_MOSTLY_PQ2_0_LEGACY  = 142, // pre-rename value for the same format, still found in published ggufs
+#     LLAMA_FTYPE_MOSTLY_PTQ1_0        = 143, // except 1d tensors (Prism group-128 ternary, 1.75 bpw)
 #
 #     LLAMA_FTYPE_GUESSED = 1024, // not specified in the model file
 # };
@@ -422,6 +422,9 @@ class llama_ftype(enum.IntEnum):
     LLAMA_FTYPE_MOSTLY_NVFP4 = 39
     LLAMA_FTYPE_MOSTLY_Q1_0 = 40
     LLAMA_FTYPE_MOSTLY_Q2_0 = 41
+    LLAMA_FTYPE_MOSTLY_PQ2_0 = 141
+    LLAMA_FTYPE_MOSTLY_PQ2_0_LEGACY = 142
+    LLAMA_FTYPE_MOSTLY_PTQ1_0 = 143
     LLAMA_FTYPE_GUESSED = 1024
 
 # // Get the model file type (quantization) as a string, e.g. "Q8_0" or "Q4_K - Medium"
@@ -787,6 +790,8 @@ class llama_model_tensor_buft_override(ctypes.Structure):
         buft: ctypes.c_void_p
 
 # struct llama_model_params {
+#     const struct llama_model * dspark_head_source;
+#
 #     // NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
 #     ggml_backend_dev_t * devices;
 
@@ -796,8 +801,6 @@ class llama_model_tensor_buft_override(ctypes.Structure):
 #     int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
 #     enum llama_split_mode split_mode; // how to split the model across multiple GPUs
 #     enum llama_load_mode  load_mode;  // how to load the model
-
-#     enum llama_lazy_mode lazy_mode; // on-demand reading of tensors marked by the arch
 
 #     // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE
 #     int32_t main_gpu;
@@ -828,12 +831,12 @@ class llama_model_params(ctypes.Structure):
     """Parameters for llama_model
 
     Attributes:
+        dspark_head_source (llama_model_p): borrowed target model for DSpark head loading
         devices (ctypes.Array[ggml_backend_dev_t]): NULL-terminated list of devices to use for offloading (if NULL, all available devices are used)
         tensor_buft_overrides(llama_model_tensor_buft_override): NULL-terminated list of buffer types to use for tensors that match a pattern
         n_gpu_layers (int): number of layers to store in VRAM, a negative value means all layers
         split_mode (int): how to split the model across multiple GPUs
         load_mode (int): how to load the model
-        lazy_mode (int): on-demand reading of tensors marked by the arch
         main_gpu (int): the GPU that is used for the entire model. main_gpu interpretation depends on split_mode: LLAMA_SPLIT_NONE: the GPU that is used for the entire model LLAMA_SPLIT_ROW: the GPU that is used for small tensors and intermediate results LLAMA_SPLIT_LAYER: ignored
         tensor_split (ctypes.Array[ctypes.ctypes.c_float]): proportion of the model (layers or rows) to offload to each GPU, size: llama_max_devices()
         progress_callback (llama_progress_callback): called with a progress value between 0.0 and 1.0. Pass NULL to disable. If the provided progress_callback returns true, model loading continues. If it returns false, model loading is immediately aborted.
@@ -847,12 +850,12 @@ class llama_model_params(ctypes.Structure):
         load_mtp (bool): whether to load MTP layers"""
 
     if TYPE_CHECKING:
+        dspark_head_source: llama_model_p
         devices: CtypesArray[ctypes.c_void_p]  # NOTE: unused
         tensor_buft_overrides: CtypesPointer[llama_model_tensor_buft_override]
         n_gpu_layers: int
         split_mode: int
         load_mode: int
-        lazy_mode: int
         main_gpu: int
         tensor_split: CtypesArray[ctypes.c_float]
         progress_callback: Callable[[float, ctypes.c_void_p], bool]
@@ -866,12 +869,12 @@ class llama_model_params(ctypes.Structure):
         load_mtp: bool
 
     _fields_ = [
+        ("dspark_head_source", ctypes.c_void_p),
         ("devices", ctypes.POINTER(ctypes.c_void_p)), # NOTE: unnused
         ("tensor_buft_overrides", ctypes.POINTER(llama_model_tensor_buft_override)),
         ("n_gpu_layers", ctypes.c_int32),
         ("split_mode", ctypes.c_int),
         ("load_mode", ctypes.c_int),
-        ("lazy_mode", ctypes.c_int),
         ("main_gpu", ctypes.c_int32),
         ("tensor_split", ctypes.POINTER(ctypes.c_float)),
         ("progress_callback", llama_progress_callback),
@@ -938,6 +941,7 @@ llama_sampler_seq_config_p = ctypes.POINTER(llama_sampler_seq_config)
 
 #     enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
 #     enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+#     const char * path_kv_mean_center;
 
 #     // Abort callback
 #     // if it returns true, execution of llama_decode() will be aborted
@@ -1000,6 +1004,7 @@ class llama_context_params(ctypes.Structure):
 
         type_k (int): data type for K cache
         type_v (int): data type for V cache
+        path_kv_mean_center (Optional[bytes]): optional K-cache mean-centering bias GGUF path
 
         abort_callback (ggml_abort_callback): abort callback if it returns true, execution of llama_decode() will be aborted
         abort_callback_data (ctypes.ctypes.c_void_p): data for abort_callback
@@ -1044,6 +1049,7 @@ class llama_context_params(ctypes.Structure):
         cb_eval_user_data: ctypes.c_void_p
         type_k: int
         type_v: int
+        path_kv_mean_center: Optional[bytes]
         abort_callback: Callable[[ctypes.c_void_p], bool]
         abort_callback_data: ctypes.c_void_p
         embeddings: bool
@@ -1083,6 +1089,7 @@ class llama_context_params(ctypes.Structure):
         ("cb_eval_user_data", ctypes.c_void_p),
         ("type_k", ctypes.c_int),
         ("type_v", ctypes.c_int),
+        ("path_kv_mean_center", ctypes.c_char_p),
         ("abort_callback", ggml_abort_callback),
         ("abort_callback_data", ctypes.c_void_p),
         ("embeddings", ctypes.c_bool),
@@ -4740,6 +4747,41 @@ def llama_sampler_init_grammar(
     ...
 
 
+# DEPRECATED(LLAMA_API struct llama_sampler * llama_sampler_init_grammar_lazy(
+#     const struct llama_vocab * vocab,
+#                   const char * grammar_str,
+#                   const char * grammar_root,
+#                  const char ** trigger_words,
+#                         size_t num_trigger_words,
+#            const llama_token * trigger_tokens,
+#                         size_t num_trigger_tokens),
+#     "use llama_sampler_init_grammar_lazy_patterns instead")
+@ctypes_function(
+    "llama_sampler_init_grammar_lazy",
+    [
+        llama_vocab_p_ctypes,
+        ctypes.c_char_p,
+        ctypes.c_char_p,
+        ctypes.POINTER(ctypes.c_char_p),
+        ctypes.c_size_t,
+        llama_token_p,
+        ctypes.c_size_t,
+    ],
+    llama_sampler_p_ctypes,
+)
+def llama_sampler_init_grammar_lazy(
+    vocab: llama_vocab_p,
+    grammar_str: bytes,
+    grammar_root: bytes,
+    trigger_words: CtypesArray[bytes],  # type: ignore
+    num_trigger_words: int,
+    trigger_tokens: CtypesArray[llama_token],
+    num_trigger_tokens: int,
+    /,
+) -> llama_sampler_p:
+    ...
+
+
 # /// @details Lazy grammar sampler, introduced in https://github.com/ggml-org/llama.cpp/pull/9639
 # /// @param trigger_patterns A list of patterns that will trigger the grammar sampler. Pattern will be matched from the start of the generation output, and grammar sampler will be fed content starting from its first match group.
 # /// @param trigger_tokens A list of tokens that will trigger the grammar sampler. Grammar sampler will be fed content starting from the trigger token included.
@@ -5184,6 +5226,7 @@ def llama_opt_param_filter_all(
 
 #     ggml_opt_get_optimizer_params get_opt_pars; // callback for calculating optimizer parameters
 #     void * get_opt_pars_ud;                     // userdata for calculating optimizer parameters
+#     enum ggml_opt_optimizer_type optimizer_type;
 # };
 class llama_opt_params(ctypes.Structure):
     _fields_ = [
@@ -5192,19 +5235,20 @@ class llama_opt_params(ctypes.Structure):
         ("param_filter_ud", ctypes.c_void_p),
         ("get_opt_pars", ggml_opt_get_optimizer_params),
         ("get_opt_pars_ud", ctypes.c_void_p),
+        ("optimizer_type", ctypes.c_int),
     ]
 
 
 # LLAMA_API void llama_opt_init(struct llama_context * lctx, struct llama_model * model, struct llama_opt_params lopt_params);
 @ctypes_function(
     "llama_opt_init",
-    [llama_context_p_ctypes, llama_model_p_ctypes, llama_opt_params_p_ctypes],
+    [llama_context_p_ctypes, llama_model_p_ctypes, llama_opt_params],
     None,
 )
 def llama_opt_init(
     lctx: llama_context_p,
     model: llama_model_p,
-    lopt_params: llama_opt_params_p, /
+    lopt_params: llama_opt_params, /
 ):
     ...
 

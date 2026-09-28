@@ -2,6 +2,10 @@
   <img src="docs/icon.png" alt="llama-cpp-python logo" width="300">
 </p>
 
+# Experimental fork of using `PrismML` llama.cpp
+
+Use Jamepeng version for stable support
+
 # Efficient Python Bindings for [`llama.cpp`](https://github.com/ggml-org/llama.cpp) library
 
 [![Tests](https://github.com/JamePeng/llama-cpp-python/actions/workflows/test.yaml/badge.svg?branch=main)](https://github.com/JamePeng/llama-cpp-python/actions/workflows/test.yaml)

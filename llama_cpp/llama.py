@@ -245,6 +245,7 @@ class Llama:
                 Useful when VRAM is insufficient for MoE models.
             split_mode: How to split the model across GPUs. See llama_cpp.LLAMA_SPLIT_* for options.
             load_mode: How to load the model. See llama_cpp.LLAMA_LOAD_MODE_* for options.
+            lazy_mode: Deprecated compatibility argument; unsupported by the Prism C API.
             main_gpu: main_gpu interpretation depends on split_mode: LLAMA_SPLIT_MODE_NONE: the GPU that is used for the entire model. LLAMA_SPLIT_MODE_ROW: the GPU that is used for small tensors and intermediate results. LLAMA_SPLIT_MODE_LAYER: ignored
             tensor_split: How split tensors should be distributed across GPUs. If None, the model is not split.
             kv_overrides: Key-value overrides for the model.
@@ -332,6 +333,12 @@ class Llama:
         """
         self.verbose = verbose
         self.verbosity = verbosity
+        if lazy_mode != llama_cpp_lib.llama_lazy_mode.LLAMA_LAZY_MODE_AUTO:
+            warnings.warn(
+                "lazy_mode is unsupported by the Prism llama.cpp C API and is ignored",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self._stack = contextlib.ExitStack()
 
         configure_logging(
@@ -416,7 +423,6 @@ class Llama:
         self.model_params.n_gpu_layers = self._parse_n_gpu_layers(n_gpu_layers)
         self.model_params.split_mode = split_mode
         self.model_params.load_mode = load_mode
-        self.model_params.lazy_mode = lazy_mode
         self.model_params.main_gpu = main_gpu
         self.tensor_split = tensor_split
         self._c_tensor_split = None
@@ -4675,7 +4681,6 @@ prompt: The prompt to generate text from.
             n_cpu_moe=self.n_cpu_moe,
             split_mode=self.model_params.split_mode,
             load_mode=self.model_params.load_mode,
-            lazy_mode=self.model_params.lazy_mode,
             main_gpu=self.model_params.main_gpu,
             tensor_split=self.tensor_split,
             kv_overrides=self.kv_overrides,

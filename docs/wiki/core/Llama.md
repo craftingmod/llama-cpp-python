@@ -43,7 +43,7 @@ model allocation for inspection and planning rather than inference.
 | `n_cpu_moe` | `int` | `0` | Number of first N MoE layers to keep on CPU (compatible with `cpu_moe`) |
 | `split_mode` | `int` | `LLAMA_SPLIT_MODE_LAYER` | Model GPU split mode:<br>• `LLAMA_SPLIT_MODE_NONE`: single GPU<br>• `LLAMA_SPLIT_MODE_ROW`: row-level split<br>• `LLAMA_SPLIT_MODE_LAYER`: layer-level split |
 | `load_mode` | `int` (`llama_load_mode`) | `LLAMA_LOAD_MODE_AUTO` | How model data is loaded. `AUTO` lets llama.cpp choose from device capabilities; the explicit `LLAMA_LOAD_MODE_*` values are described below. |
-| `lazy_mode` | `int` (`llama_lazy_mode`) | `LLAMA_LAZY_MODE_AUTO` | Controls on-demand reads for architecture-marked tensors when mmap is active. |
+| `lazy_mode` | `int` (`llama_lazy_mode`) | `LLAMA_LAZY_MODE_AUTO` | Deprecated compatibility argument. The Prism C API no longer supports it; non-default values are ignored and emit a `DeprecationWarning`. |
 | `main_gpu` | `int` | `0` | With `LLAMA_SPLIT_MODE_NONE`, selects the GPU for the whole model. With `ROW`, selects the GPU for small tensors and intermediate results. It is ignored with `LAYER`. |
 | `tensor_split` | `Optional[List[float]]` | `None` | Proportional split of tensors across GPUs (max `LLAMA_MAX_DEVICES`). |
 | `kv_overrides` | `Optional[Dict[str, Union[bool, int, float, str]]]` | `None` | Key-value overrides for the model metadata. |
@@ -70,13 +70,9 @@ arguments. It accepts a member of `llama_cpp.llama_load_mode`:
 | `LLAMA_LOAD_MODE_MMAP_MLOCK` | `3` | Memory-map the model and keep its mapped pages in RAM. |
 | `LLAMA_LOAD_MODE_DIRECT_IO` | `4` | Use direct I/O when it is available. |
 
-`lazy_mode` accepts a member of `llama_cpp.llama_lazy_mode`:
-
-| Value | Integer | Description |
-| :--- | :---: | :--- |
-| `LLAMA_LAZY_MODE_OFF` | `0` | Read complete tensors up front. |
-| `LLAMA_LAZY_MODE_AUTO` | `1` | Default. Lazily read architecture-marked tensors only when they are larger than 4 GiB. Requires mmap. |
-| `LLAMA_LAZY_MODE_ON` | `2` | Read rows of every architecture-marked tensor on demand. Requires mmap. |
+`lazy_mode` is retained for call compatibility, but the Prism C API has no
+matching model parameter. Non-default values are ignored and emit a
+`DeprecationWarning`.
 
 ```python
 import llama_cpp
@@ -84,7 +80,6 @@ import llama_cpp
 llm = llama_cpp.Llama(
     model_path="models/model.gguf",
     load_mode=llama_cpp.llama_load_mode.LLAMA_LOAD_MODE_MMAP_MLOCK,
-    lazy_mode=llama_cpp.llama_lazy_mode.LLAMA_LAZY_MODE_AUTO,
 )
 ```
 

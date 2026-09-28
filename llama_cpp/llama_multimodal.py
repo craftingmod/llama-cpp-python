@@ -123,6 +123,12 @@ class MTMDBaseHandler:
             video_ffmpeg_bin_dir,
             video_timestamp_interval_ms,
         )
+        if mtmd_helper_init_opt is not None or any(
+            value is not None for value in video_overrides
+        ):
+            raise ValueError(f"{self.log_prefix}(__init__): current fork does not support 'mtmd_helper_init_opt'/video_override option!")
+
+        '''
         if mtmd_helper_init_opt is not None and any(
             value is not None for value in video_overrides
         ):
@@ -184,7 +190,7 @@ class MTMDBaseHandler:
                 self._mtmd_helper_init_opt.video_params.timestamp_interval_ms = (
                     video_timestamp_interval_ms
                 )
-
+        '''
         self.is_support_vision = False
         self.is_support_audio = False
         self.is_support_video = False
@@ -313,7 +319,7 @@ class MTMDBaseHandler:
             buf,
             len(media_bytes),
             False,
-            self._mtmd_helper_init_opt,
+            # self._mtmd_helper_init_opt,
         )
 
         if not wrapper.bitmap:
